@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 
+	"vitess.io/vitess/go/vt/vterrors"
+
 	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -68,8 +70,6 @@ const splitCloneHTML2 = `
         <INPUT type="checkbox" id="offline" name="offline" value="true"{{if .DefaultOnline}} checked{{end}}></BR>
       <LABEL for="excludeTables">Exclude Tables: </LABEL>
         <INPUT type="text" id="excludeTables" name="excludeTables" value="/ignored/"></BR>
-      <LABEL for="strategy">Strategy: </LABEL>
-        <INPUT type="text" id="strategy" name="strategy" value=""></BR>
       <LABEL for="chunkCount">Chunk Count: </LABEL>
         <INPUT type="text" id="chunkCount" name="chunkCount" value="{{.DefaultChunkCount}}"></BR>
       <LABEL for="minRowsPerChunk">Minimun Number of Rows per Chunk (may reduce the Chunk Count): </LABEL>
@@ -86,20 +86,12 @@ const splitCloneHTML2 = `
         <INPUT type="text" id="minHealthyRdonlyTablets" name="minHealthyRdonlyTablets" value="{{.DefaultMinHealthyRdonlyTablets}}"></BR>
       <LABEL for="maxTPS">Maximum Write Transactions/second (If non-zero, writes on the destination will be throttled. Unlimited by default.): </LABEL>
         <INPUT type="text" id="maxTPS" name="maxTPS" value="{{.DefaultMaxTPS}}"></BR>
-      <LABEL for="maxReplicationLag">Maximum Replication Lag (enables the adapative throttler. Disabled by default.): </LABEL>
+      <LABEL for="maxReplicationLag">Maximum Replication Lag Seconds (enables the adapative throttler. Disabled by default.): </LABEL>
         <INPUT type="text" id="maxReplicationLag" name="maxReplicationLag" value="{{.DefaultMaxReplicationLag}}"></BR>
       <INPUT type="hidden" name="keyspace" value="{{.Keyspace}}"/>
       <INPUT type="hidden" name="shard" value="{{.Shard}}"/>
       <INPUT type="submit" value="Clone"/>
     </form>
-
-  <h1>Help</h1>
-    <p>Strategy can have the following values, comma separated:</p>
-    <ul>
-      <li><b>skipPopulateBlpCheckpoint</b>: skips creating (if necessary) and populating the blp_checkpoint table in the destination. Not skipped by default because it's required for filtered replication to start.</li>
-      <li><b>dontStartBinlogPlayer</b>: (requires skipPopulateBlpCheckpoint to be false) will setup, but not start binlog replication on the destination. The flag has to be manually cleared from the _vt.blp_checkpoint table.</li>
-      <li><b>skipSetSourceShards</b>: we won't set SourceShards on the destination shards, disabling filtered replication. Useful for worker tests.</li>
-    </ul>
   </body>
 `
 
@@ -110,7 +102,6 @@ func commandSplitClone(wi *Instance, wr *wrangler.Wrangler, subFlags *flag.FlagS
 	online := subFlags.Bool("online", defaultOnline, "do online copy (optional approximate copy, source and destination tablets will not be put out of serving, minimizes downtime during offline copy)")
 	offline := subFlags.Bool("offline", defaultOffline, "do offline copy (exact copy at a specific GTID, required before shard migration, source and destination tablets will be put out of serving during copy)")
 	excludeTables := subFlags.String("exclude_tables", "", "comma separated list of tables to exclude. Each is either an exact match, or a regular expression of the form /regexp/")
-	strategy := subFlags.String("strategy", "", "which strategy to use for restore, use 'vtworker SplitClone --strategy=-help k/s' for more info")
 	chunkCount := subFlags.Int("chunk_count", defaultChunkCount, "number of chunks per table")
 	minRowsPerChunk := subFlags.Int("min_rows_per_chunk", defaultMinRowsPerChunk, "minimum number of rows per chunk (may reduce --chunk_count)")
 	sourceReaderCount := subFlags.Int("source_reader_count", defaultSourceReaderCount, "number of concurrent streaming queries to use on the source")
@@ -119,7 +110,7 @@ func commandSplitClone(wi *Instance, wr *wrangler.Wrangler, subFlags *flag.FlagS
 	destinationWriterCount := subFlags.Int("destination_writer_count", defaultDestinationWriterCount, "number of concurrent RPCs to execute on the destination")
 	minHealthyRdonlyTablets := subFlags.Int("min_healthy_rdonly_tablets", defaultMinHealthyRdonlyTablets, "minimum number of healthy RDONLY tablets in the source and destination shard at start")
 	maxTPS := subFlags.Int64("max_tps", defaultMaxTPS, "rate limit of maximum number of (write) transactions/second on the destination (unlimited by default)")
-	maxReplicationLag := subFlags.Int64("max_replication_lag", defaultMaxReplicationLag, "if set, the adapative throttler will be enabled and automatically adjust the write rate to keep the lag below the set value (disabled by default)")
+	maxReplicationLag := subFlags.Int64("max_replication_lag", defaultMaxReplicationLag, "if set, the adapative throttler will be enabled and automatically adjust the write rate to keep the lag below the set value in seconds (disabled by default)")
 	if err := subFlags.Parse(args); err != nil {
 		return nil, err
 	}
@@ -136,9 +127,9 @@ func commandSplitClone(wi *Instance, wr *wrangler.Wrangler, subFlags *flag.FlagS
 	if *excludeTables != "" {
 		excludeTableArray = strings.Split(*excludeTables, ",")
 	}
-	worker, err := newSplitCloneWorker(wr, wi.cell, keyspace, shard, *online, *offline, excludeTableArray, *strategy, *chunkCount, *minRowsPerChunk, *sourceReaderCount, *writeQueryMaxRows, *writeQueryMaxSize, *destinationWriterCount, *minHealthyRdonlyTablets, *maxTPS, *maxReplicationLag)
+	worker, err := newSplitCloneWorker(wr, wi.cell, keyspace, shard, *online, *offline, excludeTableArray, *chunkCount, *minRowsPerChunk, *sourceReaderCount, *writeQueryMaxRows, *writeQueryMaxSize, *destinationWriterCount, *minHealthyRdonlyTablets, *maxTPS, *maxReplicationLag)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create split clone worker: %v", err)
+		return nil, vterrors.Wrap(err, "cannot create split clone worker")
 	}
 	return worker, nil
 }
@@ -148,7 +139,7 @@ func keyspacesWithOverlappingShards(ctx context.Context, wr *wrangler.Wrangler) 
 	keyspaces, err := wr.TopoServer().GetKeyspaces(shortCtx)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get list of keyspaces: %v", err)
+		return nil, vterrors.Wrap(err, "failed to get list of keyspaces")
 	}
 
 	wg := sync.WaitGroup{}
@@ -189,7 +180,7 @@ func keyspacesWithOverlappingShards(ctx context.Context, wr *wrangler.Wrangler) 
 
 func interactiveSplitClone(ctx context.Context, wi *Instance, wr *wrangler.Wrangler, w http.ResponseWriter, r *http.Request) (Worker, *template.Template, map[string]interface{}, error) {
 	if err := r.ParseForm(); err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse form: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse form")
 	}
 
 	keyspace := r.FormValue("keyspace")
@@ -237,56 +228,55 @@ func interactiveSplitClone(ctx context.Context, wi *Instance, wr *wrangler.Wrang
 	if excludeTables != "" {
 		excludeTableArray = strings.Split(excludeTables, ",")
 	}
-	strategy := r.FormValue("strategy")
 	chunkCountStr := r.FormValue("chunkCount")
 	chunkCount, err := strconv.ParseInt(chunkCountStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse chunkCount: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse chunkCount")
 	}
 	minRowsPerChunkStr := r.FormValue("minRowsPerChunk")
 	minRowsPerChunk, err := strconv.ParseInt(minRowsPerChunkStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse minRowsPerChunk: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse minRowsPerChunk")
 	}
 	sourceReaderCount, err := strconv.ParseInt(sourceReaderCountStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse sourceReaderCount: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse sourceReaderCount")
 	}
 	writeQueryMaxRowsStr := r.FormValue("writeQueryMaxRows")
 	writeQueryMaxRows, err := strconv.ParseInt(writeQueryMaxRowsStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse writeQueryMaxRows: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse writeQueryMaxRows")
 	}
 	writeQueryMaxSizeStr := r.FormValue("writeQueryMaxSize")
 	writeQueryMaxSize, err := strconv.ParseInt(writeQueryMaxSizeStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse writeQueryMaxSize: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse writeQueryMaxSize")
 	}
 	destinationWriterCountStr := r.FormValue("destinationWriterCount")
 	destinationWriterCount, err := strconv.ParseInt(destinationWriterCountStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse destinationWriterCount: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse destinationWriterCount")
 	}
 	minHealthyRdonlyTabletsStr := r.FormValue("minHealthyRdonlyTablets")
 	minHealthyRdonlyTablets, err := strconv.ParseInt(minHealthyRdonlyTabletsStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse minHealthyRdonlyTablets: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse minHealthyRdonlyTablets")
 	}
 	maxTPSStr := r.FormValue("maxTPS")
 	maxTPS, err := strconv.ParseInt(maxTPSStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse maxTPS: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse maxTPS")
 	}
 	maxReplicationLagStr := r.FormValue("maxReplicationLag")
 	maxReplicationLag, err := strconv.ParseInt(maxReplicationLagStr, 0, 64)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot parse maxReplicationLag: %s", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot parse maxReplicationLag")
 	}
 
 	// start the clone job
-	wrk, err := newSplitCloneWorker(wr, wi.cell, keyspace, shard, online, offline, excludeTableArray, strategy, int(chunkCount), int(minRowsPerChunk), int(sourceReaderCount), int(writeQueryMaxRows), int(writeQueryMaxSize), int(destinationWriterCount), int(minHealthyRdonlyTablets), maxTPS, maxReplicationLag)
+	wrk, err := newSplitCloneWorker(wr, wi.cell, keyspace, shard, online, offline, excludeTableArray, int(chunkCount), int(minRowsPerChunk), int(sourceReaderCount), int(writeQueryMaxRows), int(writeQueryMaxSize), int(destinationWriterCount), int(minHealthyRdonlyTablets), maxTPS, maxReplicationLag)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("cannot create worker: %v", err)
+		return nil, nil, nil, vterrors.Wrap(err, "cannot create worker")
 	}
 	return wrk, nil, nil, nil
 }
@@ -294,6 +284,6 @@ func interactiveSplitClone(ctx context.Context, wi *Instance, wr *wrangler.Wrang
 func init() {
 	AddCommand("Clones", Command{"SplitClone",
 		commandSplitClone, interactiveSplitClone,
-		"[--online=false] [--offline=false] [--exclude_tables=''] [--strategy=''] <keyspace/shard>",
+		"[--online=false] [--offline=false] [--exclude_tables=''] <keyspace/shard>",
 		"Replicates the data and creates configuration for a horizontal split."})
 }

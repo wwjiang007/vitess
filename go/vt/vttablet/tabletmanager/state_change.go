@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/vt/vterrors"
+
 	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/event"
@@ -33,6 +35,7 @@ import (
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/vttablet/tabletmanager/events"
+	"vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
@@ -108,9 +111,7 @@ func (agent *ActionAgent) broadcastHealth() {
 	stats := &querypb.RealtimeStats{
 		SecondsBehindMaster: uint32(replicationDelay.Seconds()),
 	}
-	if agent.BinlogPlayerMap != nil {
-		stats.SecondsBehindMasterFilteredReplication, stats.BinlogPlayersCount = agent.BinlogPlayerMap.StatusSummary()
-	}
+	stats.SecondsBehindMasterFilteredReplication, stats.BinlogPlayersCount = vreplication.StatusSummary()
 	stats.Qps = tabletenv.QPSRates.TotalRate()
 	if healthError != nil {
 		stats.HealthError = healthError.Error()
@@ -138,7 +139,7 @@ func (agent *ActionAgent) refreshTablet(ctx context.Context, reason string) erro
 	ti, err := agent.TopoServer.GetTablet(ctx, agent.TabletAlias)
 	if err != nil {
 		log.Warningf("Failed rereading tablet after %v - services may be inconsistent: %v", reason, err)
-		return fmt.Errorf("refreshTablet failed rereading tablet after %v: %v", reason, err)
+		return vterrors.Wrapf(err, "refreshTablet failed rereading tablet after %v", reason)
 	}
 	tablet := ti.Tablet
 
@@ -300,16 +301,20 @@ func (agent *ActionAgent) changeCallback(ctx context.Context, oldTablet, newTabl
 
 	// Update the stats to our current type.
 	if agent.exportStats {
-		agent.statsTabletType.Set(topoproto.TabletTypeLString(newTablet.Type))
+		s := topoproto.TabletTypeLString(newTablet.Type)
+		agent.statsTabletType.Set(s)
+		agent.statsTabletTypeCount.Add(s, 1)
 	}
 
-	// See if we need to start or stop any binlog player.
-	if agent.BinlogPlayerMap != nil {
-		if newTablet.Type == topodatapb.TabletType_MASTER {
-			agent.BinlogPlayerMap.RefreshMap(agent.batchCtx, newTablet, shardInfo)
+	// See if we need to start or stop vreplication.
+	if newTablet.Type == topodatapb.TabletType_MASTER {
+		if err := agent.VREngine.Open(agent.batchCtx); err != nil {
+			log.Errorf("Could not start VReplication engine: %v. Will keep retrying at health check intervals.", err)
 		} else {
-			agent.BinlogPlayerMap.StopAllPlayersAndReset()
+			log.Info("VReplication engine started")
 		}
+	} else {
+		agent.VREngine.Close()
 	}
 
 	// Broadcast health changes to vtgate immediately.

@@ -22,6 +22,8 @@ import (
 	"net/http"
 	"time"
 
+	"vitess.io/vitess/go/vt/vterrors"
+
 	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/mysql"
@@ -49,7 +51,7 @@ var (
 // StartServer starts the server and initializes
 // all the global variables. This function should only be called
 // once at the beginning of the test.
-func StartServer(connParams, connAppDebugParams mysql.ConnParams) error {
+func StartServer(connParams, connAppDebugParams mysql.ConnParams, dbName string) error {
 	// Setup a fake vtgate server.
 	protocol := "resolveTest"
 	*vtgateconn.VtgateProtocol = protocol
@@ -59,11 +61,7 @@ func StartServer(connParams, connAppDebugParams mysql.ConnParams) error {
 		}, nil
 	})
 
-	dbcfgs := dbconfigs.DBConfigs{
-		App:           connParams,
-		AppDebug:      connAppDebugParams,
-		SidecarDBName: "_vt",
-	}
+	dbcfgs := dbconfigs.NewTestDBConfigs(connParams, connAppDebugParams, dbName)
 
 	config := tabletenv.DefaultQsConfig
 	config.EnableAutoCommit = true
@@ -83,13 +81,13 @@ func StartServer(connParams, connAppDebugParams mysql.ConnParams) error {
 	Server.Register()
 	err := Server.StartService(Target, dbcfgs)
 	if err != nil {
-		return fmt.Errorf("could not start service: %v", err)
+		return vterrors.Wrap(err, "could not start service")
 	}
 
 	// Start http service.
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		return fmt.Errorf("could not start listener: %v", err)
+		return vterrors.Wrap(err, "could not start listener")
 	}
 	ServerAddress = fmt.Sprintf("http://%s", ln.Addr().String())
 	go http.Serve(ln, nil)

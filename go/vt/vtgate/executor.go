@@ -57,6 +57,9 @@ import (
 var (
 	errNoKeyspace     = vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "no keyspace in database name specified. Supported database name format (items in <> are optional): keyspace<:shard><@type> or keyspace<[range]><@type>")
 	defaultTabletType topodatapb.TabletType
+
+	queriesProcessed = stats.NewCountersWithSingleLabel("QueriesProcessed", "Queries processed at vtgate by plan type", "Plan")
+	queriesRouted    = stats.NewCountersWithSingleLabel("QueriesRouted", "Queries routed from vtgate to vttablet by plan type", "Plan")
 )
 
 func init() {
@@ -229,6 +232,8 @@ func (e *Executor) handleExec(ctx context.Context, safeSession *SafeSession, sql
 		// TODO(sougou): change this flow to go through V3 functions
 		// which will allow us to benefit from the autocommitable flag.
 
+		queriesProcessed.Add("ShardDirect", 1)
+
 		if destKeyspace == "" {
 			return nil, errNoKeyspace
 		}
@@ -259,6 +264,7 @@ func (e *Executor) handleExec(ctx context.Context, safeSession *SafeSession, sql
 		logStats.BindVariables = bindVars
 		result, err := e.destinationExec(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
 		logStats.ExecuteTime = time.Now().Sub(execStart)
+		queriesRouted.Add("ShardDirect", int64(logStats.ShardQueries))
 		return result, err
 	}
 
@@ -282,7 +288,11 @@ func (e *Executor) handleExec(ctx context.Context, safeSession *SafeSession, sql
 	}
 
 	qr, err := plan.Instructions.Execute(vcursor, bindVars, true)
+
 	logStats.ExecuteTime = time.Since(execStart)
+	queriesProcessed.Add(plan.Instructions.RouteType(), 1)
+	queriesRouted.Add(plan.Instructions.RouteType(), int64(logStats.ShardQueries))
+
 	var errCount uint64
 	if err != nil {
 		logStats.Error = err
@@ -337,6 +347,10 @@ func (e *Executor) handleDDL(ctx context.Context, safeSession *SafeSession, sql 
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	result, err := e.destinationExec(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
 	logStats.ExecuteTime = time.Since(execStart)
+
+	queriesProcessed.Add("DDL", 1)
+	queriesRouted.Add("DDL", int64(logStats.ShardQueries))
+
 	return result, err
 }
 
@@ -493,6 +507,9 @@ func (e *Executor) handleBegin(ctx context.Context, safeSession *SafeSession, sq
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	err := e.txConn.Begin(ctx, safeSession)
 	logStats.ExecuteTime = time.Since(execStart)
+
+	queriesProcessed.Add("Begin", 1)
+
 	return &sqltypes.Result{}, err
 }
 
@@ -500,6 +517,8 @@ func (e *Executor) handleCommit(ctx context.Context, safeSession *SafeSession, s
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	logStats.ShardQueries = uint32(len(safeSession.ShardSessions))
+	queriesProcessed.Add("Commit", 1)
+	queriesRouted.Add("Commit", int64(logStats.ShardQueries))
 	err := e.txConn.Commit(ctx, safeSession)
 	logStats.CommitTime = time.Since(execStart)
 	return &sqltypes.Result{}, err
@@ -509,6 +528,8 @@ func (e *Executor) handleRollback(ctx context.Context, safeSession *SafeSession,
 	execStart := time.Now()
 	logStats.PlanTime = execStart.Sub(logStats.StartTime)
 	logStats.ShardQueries = uint32(len(safeSession.ShardSessions))
+	queriesProcessed.Add("Rollback", 1)
+	queriesRouted.Add("Rollback", int64(logStats.ShardQueries))
 	err := e.txConn.Rollback(ctx, safeSession)
 	logStats.CommitTime = time.Since(execStart)
 	return &sqltypes.Result{}, err
@@ -608,6 +629,13 @@ func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql 
 				return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "invalid transaction_mode: %s", val)
 			}
 			safeSession.TransactionMode = vtgatepb.TransactionMode(out)
+		case sqlparser.TransactionStr:
+			// Parser ensures it's well-formed.
+
+			// TODO: This is a NOP, modeled off of tx_isolation and tx_read_only.  It's incredibly
+			// dangerous that it's a NOP, but fixing that is left to. Note that vtqueryservice needs
+			// to be updated as well:
+			// https://github.com/vitessio/vitess/issues/4127
 		case "tx_isolation":
 			val, ok := v.(string)
 			if !ok {
@@ -615,7 +643,7 @@ func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql 
 			}
 			switch val {
 			case "repeatable read", "read committed", "read uncommitted", "serializable":
-				// no op
+				// TODO (4127): This is a dangerous NOP.
 			default:
 				return nil, fmt.Errorf("unexpected value for tx_isolation: %v", val)
 			}
@@ -626,7 +654,7 @@ func (e *Executor) handleSet(ctx context.Context, safeSession *SafeSession, sql 
 			}
 			switch val {
 			case 0, 1:
-				// no op
+				// TODO (4127): This is a dangerous NOP.
 			default:
 				return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for tx_read_only: %d", val)
 			}
@@ -713,9 +741,10 @@ func validateSetOnOff(v interface{}, typ string) (int64, error) {
 	case int64:
 		val = v
 	case string:
-		if v == "on" {
+		lcaseV := strings.ToLower(v)
+		if lcaseV == "on" {
 			val = 1
-		} else if v == "off" {
+		} else if lcaseV == "off" {
 			val = 0
 		} else {
 			return -1, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "unexpected value for %s: %s", typ, v)
@@ -753,7 +782,7 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 		}
 	case sqlparser.KeywordString(sqlparser.TABLES):
 		if show.ShowTablesOpt != nil && show.ShowTablesOpt.DbName != "" {
-			show.ShowTablesOpt.DbName = "vt_" + destKeyspace
+			show.ShowTablesOpt.DbName = ""
 		}
 		sql = sqlparser.String(show)
 	case sqlparser.KeywordString(sqlparser.DATABASES), sqlparser.KeywordString(sqlparser.VITESS_KEYSPACES):
@@ -819,6 +848,14 @@ func (e *Executor) handleShow(ctx context.Context, safeSession *SafeSession, sql
 		}
 		return &sqltypes.Result{
 			Fields:       buildVarCharFields("Cell", "Keyspace", "Shard", "TabletType", "State", "Alias", "Hostname"),
+			Rows:         rows,
+			RowsAffected: uint64(len(rows)),
+		}, nil
+	case sqlparser.KeywordString(sqlparser.VITESS_TARGET):
+		var rows [][]sqltypes.Value
+		rows = append(rows, buildVarCharRow(safeSession.TargetString))
+		return &sqltypes.Result{
+			Fields:       buildVarCharFields("Target"),
 			Rows:         rows,
 			RowsAffected: uint64(len(rows)),
 		}, nil
@@ -988,6 +1025,10 @@ func (e *Executor) handleOther(ctx context.Context, safeSession *SafeSession, sq
 	}
 	execStart := time.Now()
 	result, err := e.destinationExec(ctx, safeSession, sql, bindVars, dest, destKeyspace, destTabletType, logStats)
+
+	queriesProcessed.Add("Other", 1)
+	queriesRouted.Add("Other", int64(logStats.ShardQueries))
+
 	logStats.ExecuteTime = time.Since(execStart)
 	return result, err
 }

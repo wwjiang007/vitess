@@ -20,6 +20,7 @@ limitations under the License.
 // service.
 
 syntax = "proto3";
+option go_package = "vitess.io/vitess/go/vt/proto/topodata";
 
 option java_package="io.vitess.proto";
 
@@ -220,6 +221,10 @@ message Shard {
     // what to do
     bool disable_query_service = 3;
     repeated string blacklisted_tables = 4;
+
+    // frozen is set if we've started failing over traffic for
+    // the master. If set, this record should not be removed.
+    bool frozen = 5;
   }
 
   // tablet_controls has at most one entry per TabletType.

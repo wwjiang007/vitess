@@ -153,6 +153,11 @@ func (code InsertOpcode) MarshalJSON() ([]byte, error) {
 	return json.Marshal(insName[code])
 }
 
+// RouteType returns a description of the query routing type used by the primitive
+func (ins *Insert) RouteType() string {
+	return insName[ins.Opcode]
+}
+
 // Execute performs a non-streaming exec.
 func (ins *Insert) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	switch ins.Opcode {
@@ -215,9 +220,9 @@ func (ins *Insert) execInsertSharded(vcursor VCursor, bindVars map[string]*query
 	}
 
 	autocommit := (len(rss) == 1 || ins.MultiShardAutocommit) && vcursor.AutocommitApproval()
-	result, err := vcursor.ExecuteMultiShard(rss, queries, true /* isDML */, autocommit)
-	if err != nil {
-		return nil, vterrors.Wrap(err, "execInsertSharded")
+	result, errs := vcursor.ExecuteMultiShard(rss, queries, true /* isDML */, autocommit)
+	if errs != nil {
+		return nil, vterrors.Wrap(vterrors.Aggregate(errs), "execInsertSharded")
 	}
 
 	if insertID != 0 {
@@ -451,9 +456,6 @@ func (ins *Insert) processPrimary(vcursor VCursor, vindexKeys [][]sqltypes.Value
 func (ins *Insert) processOwned(vcursor VCursor, vindexColumnsKeys [][]sqltypes.Value, colVindex *vindexes.ColumnVindex, bv map[string]*querypb.BindVariable, ksids [][]byte) error {
 	for rowNum, rowColumnKeys := range vindexColumnsKeys {
 		for colIdx, vindexKey := range rowColumnKeys {
-			if vindexKey.IsNull() {
-				return fmt.Errorf("value must be supplied for column %v", colVindex.Columns[colIdx])
-			}
 			col := colVindex.Columns[colIdx]
 			bv[insertVarName(col, rowNum)] = sqltypes.ValueBindVariable(vindexKey)
 		}
@@ -476,9 +478,6 @@ func (ins *Insert) processOwnedIgnore(vcursor VCursor, vindexColumnsKeys [][]sql
 		createKsids = append(createKsids, ksids[rowNum])
 
 		for colIdx, vindexKey := range rowColumnKeys {
-			if vindexKey.IsNull() {
-				return fmt.Errorf("value must be supplied for column %v", colVindex.Columns)
-			}
 			rowKeys = append(rowKeys, vindexKey)
 			col := colVindex.Columns[colIdx]
 			bv[insertVarName(col, rowNum)] = sqltypes.ValueBindVariable(vindexKey)

@@ -48,12 +48,10 @@ func splitAndExpression(filters []sqlparser.Expr, node sqlparser.Expr) []sqlpars
 // skipParenthesis skips the parenthesis (if any) of an expression and
 // returns the innermost unparenthesized expression.
 func skipParenthesis(node sqlparser.Expr) sqlparser.Expr {
-	for {
-		if node, ok := node.(*sqlparser.ParenExpr); ok {
-			return skipParenthesis(node.Expr)
-		}
-		return node
+	if node, ok := node.(*sqlparser.ParenExpr); ok {
+		return skipParenthesis(node.Expr)
 	}
+	return node
 }
 
 // findOrigin identifies the right-most origin referenced by expr. In situations where
@@ -126,8 +124,6 @@ func (pb *primitiveBuilder) findOrigin(expr sqlparser.Expr) (origin builder, pus
 				if rb, isRoute := pb.bldr.(*route); !isRoute || rb.ERoute.Keyspace.Sharded {
 					return false, errors.New("unsupported: LAST_INSERT_ID is only allowed for unsharded keyspaces")
 				}
-			case node.Name.EqualString("database"):
-				expr = sqlparser.ReplaceExpr(expr, node, sqlparser.NewStrVal([]byte(pb.vschema.TargetString())))
 			}
 			return true, nil
 		}

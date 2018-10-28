@@ -91,7 +91,7 @@ func Preview(sql string) int {
 		return StmtRollback
 	}
 	switch loweredFirstWord {
-	case "create", "alter", "rename", "drop", "truncate":
+	case "create", "alter", "rename", "drop", "truncate", "flush":
 		return StmtDDL
 	case "set":
 		return StmtSet
@@ -275,13 +275,14 @@ func ExtractSetValues(sql string) (keyValues map[SetKey]interface{}, scope strin
 	}
 	result := make(map[SetKey]interface{})
 	for _, expr := range setStmt.Exprs {
-		scope := SessionStr
+		scope := ImplicitStr
 		key := expr.Name.Lowered()
 		switch {
 		case strings.HasPrefix(key, "@@global."):
 			scope = GlobalStr
 			key = strings.TrimPrefix(key, "@@global.")
 		case strings.HasPrefix(key, "@@session."):
+			scope = SessionStr
 			key = strings.TrimPrefix(key, "@@session.")
 		case strings.HasPrefix(key, "@@"):
 			key = strings.TrimPrefix(key, "@@")

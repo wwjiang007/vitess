@@ -28,6 +28,7 @@ import (
 	"vitess.io/vitess/go/mysql/fakesqldb"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/dbconnpool"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
@@ -43,9 +44,6 @@ type FakeMysqlDaemon struct {
 
 	// appPool is set if db is set.
 	appPool *dbconnpool.ConnectionPool
-
-	// Mycnf will be returned by Cnf()
-	Mycnf *mysqlctl.Mycnf
 
 	// Running is used by Start / Shutdown
 	Running bool
@@ -128,7 +126,7 @@ type FakeMysqlDaemon struct {
 	FetchSuperQueryMap map[string]*sqltypes.Result
 
 	// BinlogPlayerEnabled is used by {Enable,Disable}BinlogPlayer
-	BinlogPlayerEnabled bool
+	BinlogPlayerEnabled sync2.AtomicBool
 
 	// SemiSyncMasterEnabled represents the state of rpl_semi_sync_master_enabled.
 	SemiSyncMasterEnabled bool
@@ -151,18 +149,8 @@ func NewFakeMysqlDaemon(db *fakesqldb.DB) *FakeMysqlDaemon {
 	return result
 }
 
-// Cnf is part of the MysqlDaemon interface
-func (fmd *FakeMysqlDaemon) Cnf() *mysqlctl.Mycnf {
-	return fmd.Mycnf
-}
-
-// TabletDir is part of the MysqlDaemon interface.
-func (fmd *FakeMysqlDaemon) TabletDir() string {
-	return ""
-}
-
 // Start is part of the MysqlDaemon interface
-func (fmd *FakeMysqlDaemon) Start(ctx context.Context, mysqldArgs ...string) error {
+func (fmd *FakeMysqlDaemon) Start(ctx context.Context, cnf *mysqlctl.Mycnf, mysqldArgs ...string) error {
 	if fmd.Running {
 		return fmt.Errorf("fake mysql daemon already running")
 	}
@@ -171,7 +159,7 @@ func (fmd *FakeMysqlDaemon) Start(ctx context.Context, mysqldArgs ...string) err
 }
 
 // Shutdown is part of the MysqlDaemon interface
-func (fmd *FakeMysqlDaemon) Shutdown(ctx context.Context, waitForMysqld bool) error {
+func (fmd *FakeMysqlDaemon) Shutdown(ctx context.Context, cnf *mysqlctl.Mycnf, waitForMysqld bool) error {
 	if !fmd.Running {
 		return fmt.Errorf("fake mysql daemon not running")
 	}
@@ -185,17 +173,17 @@ func (fmd *FakeMysqlDaemon) RunMysqlUpgrade() error {
 }
 
 // ReinitConfig is part of the MysqlDaemon interface
-func (fmd *FakeMysqlDaemon) ReinitConfig(ctx context.Context) error {
+func (fmd *FakeMysqlDaemon) ReinitConfig(ctx context.Context, cnf *mysqlctl.Mycnf) error {
 	return nil
 }
 
 // RefreshConfig is part of the MysqlDaemon interface
-func (fmd *FakeMysqlDaemon) RefreshConfig(ctx context.Context) error {
+func (fmd *FakeMysqlDaemon) RefreshConfig(ctx context.Context, cnf *mysqlctl.Mycnf) error {
 	return nil
 }
 
 // Wait is part of the MysqlDaemon interface.
-func (fmd *FakeMysqlDaemon) Wait(ctx context.Context) error {
+func (fmd *FakeMysqlDaemon) Wait(ctx context.Context, cnf *mysqlctl.Mycnf) error {
 	return nil
 }
 
@@ -358,19 +346,13 @@ func (fmd *FakeMysqlDaemon) FetchSuperQuery(ctx context.Context, query string) (
 
 // EnableBinlogPlayback is part of the MysqlDaemon interface
 func (fmd *FakeMysqlDaemon) EnableBinlogPlayback() error {
-	if fmd.BinlogPlayerEnabled {
-		return fmt.Errorf("binlog player already enabled")
-	}
-	fmd.BinlogPlayerEnabled = true
+	fmd.BinlogPlayerEnabled.Set(true)
 	return nil
 }
 
 // DisableBinlogPlayback disable playback of binlog events
 func (fmd *FakeMysqlDaemon) DisableBinlogPlayback() error {
-	if fmd.BinlogPlayerEnabled {
-		return fmt.Errorf("binlog player already disabled")
-	}
-	fmd.BinlogPlayerEnabled = false
+	fmd.BinlogPlayerEnabled.Set(false)
 	return nil
 }
 

@@ -30,6 +30,8 @@ const (
 	DirectiveSkipQueryPlanCache = "SKIP_QUERY_PLAN_CACHE"
 	// DirectiveQueryTimeout sets a query timeout in vtgate. Only supported for SELECTS.
 	DirectiveQueryTimeout = "QUERY_TIMEOUT_MS"
+	// DirectiveScatterErrorsAsWarnings enables partial success scatter select queries
+	DirectiveScatterErrorsAsWarnings = "SCATTER_ERRORS_AS_WARNINGS"
 )
 
 func isNonSpace(r rune) bool {
@@ -158,6 +160,28 @@ func StripLeadingComments(sql string) string {
 
 func hasCommentPrefix(sql string) bool {
 	return len(sql) > 1 && ((sql[0] == '/' && sql[1] == '*') || (sql[0] == '-' && sql[1] == '-'))
+}
+
+// StripComments removes all comments from the string regardless
+// of where they occur
+func StripComments(sql string) string {
+	sql = StripLeadingComments(sql) // handle -- or /* ... */ at the beginning
+
+	for {
+		start := strings.Index(sql, "/*")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(sql, "*/")
+		if end <= 1 {
+			break
+		}
+		sql = sql[:start] + sql[end+2:]
+	}
+
+	sql = strings.TrimFunc(sql, unicode.IsSpace)
+
+	return sql
 }
 
 // ExtractMysqlComment extracts the version and SQL from a comment-only query

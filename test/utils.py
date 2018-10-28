@@ -302,8 +302,9 @@ def run_fail(cmd, **kargs):
   proc = subprocess.Popen(args, **kargs)
   proc.args = args
   stdout, stderr = proc.communicate()
-  if proc.returncode == 0:
+  if proc.returncode == 0 or options.verbose == 2:
     logging.info('stdout:\n%sstderr:\n%s', stdout, stderr)
+  if proc.returncode == 0:
     raise TestError('expected fail:', args, stdout, stderr)
   return stdout, stderr
 
@@ -1205,7 +1206,7 @@ class Vtctld(object):
         '-enable_queries',
         '-cell', 'test_nj',
         '-web_dir', environment.vttop + '/web/vtctld',
-        '-web_dir2', environment.vttop + '/web/vtctld2/dist',
+        '-web_dir2', environment.vttop + '/web/vtctld2',
         '--log_dir', environment.vtlogroot,
         '--port', str(self.port),
         '-tablet_manager_protocol',
@@ -1217,6 +1218,8 @@ class Vtctld(object):
         '-workflow_manager_init',
         '-workflow_manager_use_election',
         '-schema_swap_delay_between_errors', '1s',
+        '-wait_for_drain_sleep_rdonly', '1s',
+        '-wait_for_drain_sleep_replica', '1s',
     ] + environment.topo_server().flags()
     if extra_flags:
       args += extra_flags

@@ -87,6 +87,10 @@ func parseFlags() (config vttest.Config, env vttest.Environment, err error) {
 		"Default directory for initial schema files. If no schema is found"+
 			" in schema_dir, default to this location.")
 
+	flag.StringVar(&config.DataDir, "data_dir", "",
+		"Directory where the data files will be placed, defaults to a random "+
+			"directory under /vt/vtdataroot")
+
 	flag.BoolVar(&config.OnlyMySQL, "mysql_only", false,
 		"If this flag is set only mysql is initialized."+
 			" The rest of the vitess components are not started."+
@@ -125,6 +129,9 @@ func parseFlags() (config vttest.Config, env vttest.Environment, err error) {
 	flag.StringVar(&config.WebDir2, "web_dir2", "",
 		"location of the vtctld2 web server files.")
 
+	flag.StringVar(&config.MySQLBindHost, "mysql_bind_host", "localhost",
+		"which host to bind vtgate mysql listener to")
+
 	flag.StringVar(&mycnf, "extra_my_cnf", "",
 		"extra files to add to the config, separated by ':'")
 
@@ -142,12 +149,21 @@ func parseFlags() (config vttest.Config, env vttest.Environment, err error) {
 	flag.StringVar(&config.SnapshotFile, "snapshot_file", "",
 		"A MySQL DB snapshot file")
 
+	flag.StringVar(&config.TransactionMode, "transaction_mode", "MULTI", "Transaction mode MULTI (default), SINGLE or TWOPC ")
+
 	flag.Parse()
 
 	if basePort != 0 {
-		env, err = vttest.NewLocalTestEnv("", basePort)
-		if err != nil {
-			return
+		if config.DataDir == "" {
+			env, err = vttest.NewLocalTestEnv("", basePort)
+			if err != nil {
+				return
+			}
+		} else {
+			env, err = vttest.NewLocalTestEnvWithDirectory("", basePort, config.DataDir)
+			if err != nil {
+				return
+			}
 		}
 	}
 
@@ -205,12 +221,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Info("Local cluster started. Waiting for stdin input...")
+	log.Info("Local cluster started.")
 
-	_, err = fmt.Scanln()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Info("Shutting down cleanly")
+	select {}
 }

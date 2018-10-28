@@ -114,6 +114,7 @@ spec:
         - name: vt
           emptyDir: {}
 {{ include "backup-volume" $config.backup | indent 8 }}
+{{ include "user-config-volume" $defaultVttablet.extraMyCnf | indent 8 }}
 
   volumeClaimTemplates:
     - metadata:
@@ -152,7 +153,7 @@ kind: Job
 metadata:
   name: {{ $shardName }}-init-shard-master
 spec:
-  backoffLimit: 0
+  backoffLimit: 1
   template:
     spec:
       restartPolicy: OnFailure
@@ -359,6 +360,7 @@ spec:
     - name: vtdataroot
       mountPath: "/vtdataroot"
 {{ include "backup-volumeMount" $config.backup | indent 4 }}
+{{ include "user-config-volumeMount" $defaultVttablet.extraMyCnf | indent 4 }}
 
   resources:
 {{ toYaml (.resources | default $defaultVttablet.resources) | indent 6 }}
@@ -383,7 +385,7 @@ spec:
     - |
       set -ex
 
-{{ include "mycnf-exec" . | indent 6 }}
+{{ include "mycnf-exec" $defaultVttablet.extraMyCnf | indent 6 }}
 {{ include "backup-exec" $config.backup | indent 6 }}
       
       eval exec /vt/bin/vttablet $(cat <<END_OF_COMMAND
@@ -402,18 +404,6 @@ spec:
         -init_tablet_type {{ $tablet.type | quote }}
         -health_check_interval "5s"
         -mysqlctl_socket "/vtdataroot/mysqlctl.sock"
-        -db-config-app-uname "vt_app"
-        -db-config-app-dbname "vt_{{$keyspace.name}}"
-        -db-config-app-charset "utf8"
-        -db-config-dba-uname "vt_dba"
-        -db-config-dba-dbname "vt_{{$keyspace.name}}"
-        -db-config-dba-charset "utf8"
-        -db-config-repl-uname "vt_repl"
-        -db-config-repl-dbname "vt_{{$keyspace.name}}"
-        -db-config-repl-charset "utf8"
-        -db-config-filtered-uname "vt_filtered"
-        -db-config-filtered-dbname "vt_{{$keyspace.name}}"
-        -db-config-filtered-charset "utf8"
         -enable_replication_reporter
 {{ if $defaultVttablet.enableSemisync }}
         -enable_semi_sync
@@ -460,6 +450,7 @@ spec:
       mountPath: /vtdataroot
     - name: vt
       mountPath: /vt
+{{ include "user-config-volumeMount" $defaultVttablet.extraMyCnf | indent 4 }}
   resources:
 {{ toYaml (.mysqlResources | default $defaultVttablet.mysqlResources) | indent 6 }}
   env:
@@ -477,7 +468,7 @@ spec:
     - |
       set -ex
 
-{{ include "mycnf-exec" . | indent 6 }}
+{{ include "mycnf-exec" $defaultVttablet.extraMyCnf | indent 6 }}
 
       eval exec /vt/bin/mysqlctld $(cat <<END_OF_COMMAND
         -logtostderr=true
@@ -485,8 +476,6 @@ spec:
         -tablet_dir "tabletdata"
         -tablet_uid "{{$uid}}"
         -socket_file "/vtdataroot/mysqlctl.sock"
-        -db-config-dba-uname "vt_dba"
-        -db-config-dba-charset "utf8"
         -init_db_sql_file "/vt/config/init_db.sql"
 
       END_OF_COMMAND

@@ -17,6 +17,7 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -25,6 +26,8 @@ import (
 	"path"
 	"strconv"
 	"time"
+
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/timer"
 	"vitess.io/vitess/go/vt/log"
@@ -52,7 +55,7 @@ func newOrcClient() (*orcClient, error) {
 	}
 	apiRoot, err := url.Parse(*orcAddr)
 	if err != nil {
-		return nil, fmt.Errorf("can't parse -orc_api_url flag value (%v): %v", *orcAddr, err)
+		return nil, vterrors.Wrapf(err, "can't parse -orc_api_url flag value (%v)", *orcAddr)
 	}
 	return &orcClient{
 		apiRoot:    apiRoot,
@@ -126,6 +129,36 @@ func (orc *orcClient) EndMaintenance(tablet *topodatapb.Tablet) error {
 	}
 	_, err = orc.apiGet("end-maintenance", host, port)
 	return err
+}
+
+func (orc *orcClient) InActiveShardRecovery(tablet *topodatapb.Tablet) (bool, error) {
+	alias := fmt.Sprintf("%v.%v", tablet.GetKeyspace(), tablet.GetShard())
+
+	// TODO(zmagg): Replace this with simpler call to active-cluster-recovery
+	// when call with alias parameter is supported.
+	resp, err := orc.apiGet("audit-recovery", "alias", alias)
+
+	if err != nil {
+		return false, err
+	}
+
+	var r []map[string]interface{}
+
+	if err := json.Unmarshal(resp, &r); err != nil {
+		return false, err
+	}
+
+	// Orchestrator returns a 0-length response when it has no history of recovery on this cluster.
+	if len(r) == 0 {
+		return false, nil
+	}
+
+	active, ok := r[0]["IsActive"].(bool)
+
+	if !ok {
+		return false, fmt.Errorf("Error parsing JSON response from Orchestrator")
+	}
+	return active, nil
 }
 
 func mysqlHostPort(tablet *topodatapb.Tablet) (host, port string, err error) {

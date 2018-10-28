@@ -342,7 +342,7 @@ func TestVTGateExecuteWithKeyspaceShard(t *testing.T) {
 		"select id from none",
 		nil,
 	)
-	want = "vtgate: : target: TestUnsharded.noshard.master, no valid tablet: node doesn't exist"
+	want = "vtgate: : target: TestUnsharded.noshard.master, no valid tablet: node doesn't exist: TestUnsharded/noshard (MASTER)"
 	if err == nil || err.Error() != want {
 		t.Errorf("Execute: %v, want %s", err, want)
 	}
@@ -2032,7 +2032,7 @@ func testErrorPropagation(t *testing.T, sbcs []*sandboxconn.SandboxConn, before 
 	} else {
 		ec := vterrors.Code(err)
 		if ec != expected {
-			t.Errorf("unexpected error, got %v want %v: %v", ec, expected, err)
+			t.Errorf("unexpected error, got code %v err %v, want %v", ec, err, expected)
 		}
 	}
 	for _, sbc := range sbcs {

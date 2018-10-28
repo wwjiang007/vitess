@@ -166,6 +166,28 @@ func Connect(ctx context.Context, params *ConnParams) (*Conn, error) {
 	return c, nil
 }
 
+// Ping implements mysql ping command.
+func (c *Conn) Ping() error {
+	// This is a new command, need to reset the sequence.
+	c.sequence = 0
+
+	if err := c.writePacket([]byte{ComPing}); err != nil {
+		return NewSQLError(CRServerGone, SSUnknownSQLState, "%v", err)
+	}
+	data, err := c.readEphemeralPacket()
+	if err != nil {
+		return NewSQLError(CRServerLost, SSUnknownSQLState, "%v", err)
+	}
+	defer c.recycleReadPacket()
+	switch data[0] {
+	case OKPacket:
+		return nil
+	case ErrPacket:
+		return ParseErrorPacket(data)
+	}
+	return fmt.Errorf("unexpected packet type: %d", data[0])
+}
+
 // parseCharacterSet parses the provided character set.
 // Returns SQLError(CRCantReadCharset) if it can't.
 func parseCharacterSet(cs string) (uint8, error) {
@@ -221,13 +243,14 @@ func (c *Conn) clientHandshake(characterSet uint8, params *ConnParams) error {
 		}
 
 		// The ServerName to verify depends on what the hostname is.
+		// We use the params's ServerName if specified. Otherwise:
 		// - If using a socket, we use "localhost".
 		// - If it is an IP address, we need to prefix it with 'IP:'.
 		// - If not, we can just use it as is.
-		// We may need to add a ServerName field to ConnParams to
-		// make this more explicit.
 		serverName := "localhost"
-		if params.Host != "" {
+		if params.ServerName != "" {
+			serverName = params.ServerName
+		} else if params.Host != "" {
 			if net.ParseIP(params.Host) != nil {
 				serverName = "IP:" + params.Host
 			} else {
@@ -249,8 +272,7 @@ func (c *Conn) clientHandshake(characterSet uint8, params *ConnParams) error {
 		// Switch to SSL.
 		conn := tls.Client(c.conn, clientConfig)
 		c.conn = conn
-		c.reader.Reset(conn)
-		c.writer.Reset(conn)
+		c.bufferedReader.Reset(conn)
 		c.Capabilities |= CapabilityClientSSL
 	}
 
@@ -507,7 +529,7 @@ func (c *Conn) writeSSLRequest(capabilities uint32, characterSet uint8, params *
 	pos = writeByte(data, pos, characterSet)
 
 	// And send it as is.
-	if err := c.writeEphemeralPacket(true /* direct */); err != nil {
+	if err := c.writeEphemeralPacket(); err != nil {
 		return NewSQLError(CRServerLost, SSUnknownSQLState, "cannot send SSLRequest: %v", err)
 	}
 	return nil
@@ -599,7 +621,7 @@ func (c *Conn) writeHandshakeResponse41(capabilities uint32, scrambledPassword [
 		return NewSQLError(CRMalformedPacket, SSUnknownSQLState, "writeHandshakeResponse41: only packed %v bytes, out of %v allocated", pos, len(data))
 	}
 
-	if err := c.writeEphemeralPacket(true /* direct */); err != nil {
+	if err := c.writeEphemeralPacket(); err != nil {
 		return NewSQLError(CRServerLost, SSUnknownSQLState, "cannot send HandshakeResponse41: %v", err)
 	}
 	return nil
@@ -626,5 +648,5 @@ func (c *Conn) writeClearTextPassword(params *ConnParams) error {
 	if pos != len(data) {
 		return fmt.Errorf("error building ClearTextPassword packet: got %v bytes expected %v", pos, len(data))
 	}
-	return c.writeEphemeralPacket(true)
+	return c.writeEphemeralPacket()
 }
