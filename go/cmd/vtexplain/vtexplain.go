@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,6 +55,7 @@ var (
 		"vschema",
 		"vschema-file",
 		"dbname",
+		"queryserver-config-passthrough-dmls",
 	}
 )
 
@@ -63,7 +64,7 @@ func usage() {
 	for _, name := range vtexplainFlags {
 		f := flag.Lookup(name)
 		if f == nil {
-			panic("unkown flag " + name)
+			panic("unknown flag " + name)
 		}
 		flagUsage(f)
 	}
@@ -116,12 +117,13 @@ func getFileParam(flag, flagFile, name string) (string, error) {
 	}
 	data, err := ioutil.ReadFile(flagFile)
 	if err != nil {
-		return "", fmt.Errorf("Cannot read file %v: %v", flagFile, err)
+		return "", fmt.Errorf("cannot read file %v: %v", flagFile, err)
 	}
 	return string(data), nil
 }
 
 func main() {
+	defer vtexplain.Stop()
 	defer exit.RecoverAll()
 	defer logutil.Flush()
 
@@ -177,8 +179,6 @@ func parseAndRun() error {
 	} else {
 		fmt.Print(vtexplain.ExplainsAsJSON(plans))
 	}
-
-	vtexplain.Stop()
 
 	return nil
 }

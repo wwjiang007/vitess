@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -81,10 +81,12 @@ func TestMigrateServedFrom(t *testing.T) {
 	// sourceMaster will see the refresh, and has to respond to it
 	// also will be asked about its replication position.
 	sourceMaster.FakeMysqlDaemon.CurrentMasterPosition = mysql.Position{
-		GTIDSet: mysql.MariadbGTID{
-			Domain:   5,
-			Server:   456,
-			Sequence: 892,
+		GTIDSet: mysql.MariadbGTIDSet{
+			5: mysql.MariadbGTID{
+				Domain:   5,
+				Server:   456,
+				Sequence: 892,
+			},
 		},
 	}
 	sourceMaster.StartActionLoop(t, wr)
@@ -101,29 +103,30 @@ func TestMigrateServedFrom(t *testing.T) {
 	destMaster.StartActionLoop(t, wr)
 	defer destMaster.StopActionLoop(t)
 
-	// Override with a fake VREngine after Agent is initialized in action loop.
+	// Override with a fake VREngine after TM is initialized in action loop.
 	dbClient := binlogplayer.NewMockDBClient(t)
 	dbClientFactory := func() binlogplayer.DBClient { return dbClient }
-	destMaster.Agent.VREngine = vreplication.NewEngine(ts, "", destMaster.FakeMysqlDaemon, dbClientFactory)
-	dbClient.ExpectRequest("select * from _vt.vreplication", &sqltypes.Result{}, nil)
-	if err := destMaster.Agent.VREngine.Open(context.Background()); err != nil {
+	destMaster.TM.VREngine = vreplication.NewTestEngine(ts, "", destMaster.FakeMysqlDaemon, dbClientFactory, dbClient.DBName(), nil)
+	dbClient.ExpectRequest("select * from _vt.vreplication where db_name='db'", &sqltypes.Result{}, nil)
+	if err := destMaster.TM.VREngine.Open(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// select pos from _vt.vreplication
-	dbClient.ExpectRequest("select pos from _vt.vreplication where id=1", &sqltypes.Result{Rows: [][]sqltypes.Value{{
+	// select pos, state, message from _vt.vreplication
+	dbClient.ExpectRequest("select pos, state, message from _vt.vreplication where id=1", &sqltypes.Result{Rows: [][]sqltypes.Value{{
 		sqltypes.NewVarBinary("MariaDB/5-456-892"),
+		sqltypes.NewVarBinary("Running"),
+		sqltypes.NewVarBinary(""),
 	}}}, nil)
-	dbClient.ExpectRequest("use _vt", &sqltypes.Result{}, nil)
-	dbClient.ExpectRequest("delete from _vt.vreplication where id = 1", &sqltypes.Result{RowsAffected: 1}, nil)
+	expectDeleteVRepl(dbClient)
 
 	// simulate the clone, by fixing the dest shard record
 	if err := vp.Run([]string{"SourceShardAdd", "--tables", "gone1,gone2", "dest/0", "1", "source/0"}); err != nil {
 		t.Fatalf("SourceShardAdd failed: %v", err)
 	}
 
-	// migrate rdonly over
-	if err := vp.Run([]string{"MigrateServedFrom", "dest/0", "rdonly"}); err != nil {
-		t.Fatalf("MigrateServedFrom(rdonly) failed: %v", err)
+	// migrate rdonly over in a cell
+	if err := vp.Run([]string{"MigrateServedFrom", "--cells", "cell1", "dest/0", "rdonly"}); err != nil {
+		t.Fatalf("MigrateServedFrom(rdonly) cell2 failed: %v", err)
 	}
 
 	// check it's gone from keyspace
@@ -140,13 +143,68 @@ func TestMigrateServedFrom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetShard failed: %v", err)
 	}
-	if len(si.TabletControls) != 1 || !reflect.DeepEqual(si.TabletControls, []*topodatapb.Shard_TabletControl{
+	expected := []*topodatapb.Shard_TabletControl{
+		{
+			TabletType:        topodatapb.TabletType_RDONLY,
+			Cells:             []string{"cell1"},
+			BlacklistedTables: []string{"gone1", "gone2"},
+		},
+	}
+	if len(si.TabletControls) != 1 || !reflect.DeepEqual(si.TabletControls, expected) {
+		t.Fatalf("rdonly type doesn't have right blacklisted tables. Expected: %v, got: %v", expected, si.TabletControls)
+	}
+
+	// migrate rdonly reverse cell
+	if err := vp.Run([]string{"MigrateServedFrom", "--cells", "cell1", "--reverse", "dest/0", "rdonly"}); err != nil {
+		t.Fatalf("MigrateServedFrom(rdonly) cell2 failed: %v", err)
+	}
+
+	// check it's gone from keyspace
+	ki, err = ts.GetKeyspace(ctx, "dest")
+	if err != nil {
+		t.Fatalf("GetKeyspace failed: %v", err)
+	}
+	if len(ki.ServedFroms) != 3 {
+		t.Fatalf("bad initial dest ServedFroms: %v", ki.ServedFroms)
+	}
+
+	// check the source shard has the right blacklisted tables
+	si, err = ts.GetShard(ctx, "source", "0")
+	if err != nil {
+		t.Fatalf("GetShard failed: %v", err)
+	}
+
+	if len(si.TabletControls) != 0 {
+		t.Fatalf("rdonly type doesn't have right blacklisted tables. Expected: nil, got: %v", si.TabletControls)
+	}
+
+	// Now migrate rdonly over
+	if err := vp.Run([]string{"MigrateServedFrom", "dest/0", "rdonly"}); err != nil {
+		t.Fatalf("MigrateServedFrom(rdonly) failed: %v", err)
+	}
+
+	// check it's gone from keyspace
+	ki, err = ts.GetKeyspace(ctx, "dest")
+	if err != nil {
+		t.Fatalf("GetKeyspace failed: %v", err)
+	}
+	if len(ki.ServedFroms) != 2 || ki.GetServedFrom(topodatapb.TabletType_RDONLY) != nil {
+		t.Fatalf("bad initial dest ServedFroms: %v", ki.ServedFroms)
+	}
+
+	// check the source shard has the right blacklisted tables
+	si, err = ts.GetShard(ctx, "source", "0")
+	if err != nil {
+		t.Fatalf("GetShard failed: %v", err)
+	}
+	expected = []*topodatapb.Shard_TabletControl{
 		{
 			TabletType:        topodatapb.TabletType_RDONLY,
 			BlacklistedTables: []string{"gone1", "gone2"},
 		},
-	}) {
-		t.Fatalf("rdonly type doesn't have right blacklisted tables")
+	}
+	if len(si.TabletControls) != 1 || !reflect.DeepEqual(si.TabletControls, expected) {
+		t.Fatalf("rdonly type doesn't have right blacklisted tables. Expected: %v, got: %v", expected, si.TabletControls)
 	}
 
 	// migrate replica over

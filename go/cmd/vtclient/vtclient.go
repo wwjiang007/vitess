@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -64,15 +64,21 @@ Examples:
 	jsonOutput    = flag.Bool("json", false, "Output JSON instead of human-readable table")
 	parallel      = flag.Int("parallel", 1, "DMLs only: Number of threads executing the same query in parallel. Useful for simple load testing.")
 	count         = flag.Int("count", 1, "DMLs only: Number of times each thread executes the query. Useful for simple, sustained load testing.")
-	minRandomID   = flag.Int("min_random_id", 0, "min random ID to generate. When max_random_id > min_random_id, for each query, a random number is generated in [min_random_id, max_random_id) and attached to the end of the bind variables.")
-	maxRandomID   = flag.Int("max_random_id", 0, "max random ID.")
+	minSeqID      = flag.Int("min_sequence_id", 0, "min sequence ID to generate. When max_sequence_id > min_sequence_id, for each query, a number is generated in [min_sequence_id, max_sequence_id) and attached to the end of the bind variables.")
+	maxSeqID      = flag.Int("max_sequence_id", 0, "max sequence ID.")
+	useRandom     = flag.Bool("use_random_sequence", false, "use random sequence for generating [min_sequence_id, max_sequence_id)")
+	qps           = flag.Int("qps", 0, "queries per second to throttle each thread at.")
+)
+
+var (
+	seqChan = make(chan int, 10)
 )
 
 func init() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, usage)
 	}
 }
 
@@ -149,6 +155,21 @@ func run() (*results, error) {
 		return nil, errors.New("no additional arguments after the query allowed")
 	}
 
+	if *maxSeqID > *minSeqID {
+		go func() {
+			if *useRandom {
+				rand.Seed(time.Now().UnixNano())
+				for {
+					seqChan <- rand.Intn(*maxSeqID-*minSeqID) + *minSeqID
+				}
+			} else {
+				for i := *minSeqID; i < *maxSeqID; i++ {
+					seqChan <- i
+				}
+			}
+		}()
+	}
+
 	c := vitessdriver.Configuration{
 		Protocol:  *vtgateconn.VtgateProtocol,
 		Address:   *server,
@@ -168,9 +189,10 @@ func run() (*results, error) {
 }
 
 func prepareBindVariables() []interface{} {
-	bv := *bindVariables
-	if *maxRandomID > *minRandomID {
-		bv = append(bv, rand.Intn(*maxRandomID-*minRandomID)+*minRandomID)
+	bv := make([]interface{}, 0, len(*bindVariables)+1)
+	bv = append(bv, (*bindVariables)...)
+	if *maxSeqID > *minSeqID {
+		bv = append(bv, <-seqChan)
 	}
 	return bv
 }
@@ -181,12 +203,20 @@ func execMulti(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 	wg := sync.WaitGroup{}
 	isDML := sqlparser.IsDML(sql)
 
+	isThrottled := *qps > 0
+
 	start := time.Now()
 	for i := 0; i < *parallel; i++ {
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
+
+			var ticker *time.Ticker
+			if isThrottled {
+				tickDuration := time.Second / time.Duration(*qps)
+				ticker = time.NewTicker(tickDuration)
+			}
 
 			for j := 0; j < *count; j++ {
 				var qr *results
@@ -207,6 +237,10 @@ func execMulti(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 				if err != nil {
 					ec.RecordError(err)
 					// We keep going and do not return early purpose.
+				}
+
+				if ticker != nil {
+					<-ticker.C
 				}
 			}
 		}()
@@ -236,8 +270,8 @@ func execDml(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 		return nil, vterrors.Wrap(err, "COMMIT failed")
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	lastInsertID, err := result.LastInsertId()
+	rowsAffected, _ := result.RowsAffected()
+	lastInsertID, _ := result.LastInsertId()
 	return &results{
 		rowsAffected: rowsAffected,
 		lastInsertID: lastInsertID,
@@ -257,7 +291,7 @@ func execNonDml(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 	var qr results
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, fmt.Errorf("client error: %v", err)
+		return nil, vterrors.Wrap(err, "client error")
 	}
 	qr.Fields = cols
 
@@ -269,7 +303,7 @@ func execNonDml(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 			row[i] = &col
 		}
 		if err := rows.Scan(row...); err != nil {
-			return nil, fmt.Errorf("client error: %v", err)
+			return nil, vterrors.Wrap(err, "client error")
 		}
 
 		// unpack []*string into []string
@@ -282,7 +316,7 @@ func execNonDml(ctx context.Context, db *sql.DB, sql string) (*results, error) {
 	qr.rowsAffected = int64(len(qr.Rows))
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("Vitess returned an error: %v", err)
+		return nil, vterrors.Wrap(err, "Vitess returned an error")
 	}
 
 	qr.duration = time.Since(start)

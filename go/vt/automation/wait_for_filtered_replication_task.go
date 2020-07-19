@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 )
 
 // WaitForFilteredReplicationTask runs vtctl WaitForFilteredReplication to block until the destination master
-// (i.e. the receiving side of the filtered replication) has caught up up to max_delay with the source shard.
+// (i.e. the receiving side of the filtered replication) has caught up to max_delay with the source shard.
 type WaitForFilteredReplicationTask struct {
 }
 

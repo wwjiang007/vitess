@@ -1,11 +1,10 @@
 # Release Instructions
 
-This page describes the steps for cutting a new [open source release]
-(https://github.com/vitessio/vitess/releases).
+This page describes the steps for cutting a new [open source release](https://github.com/vitessio/vitess/releases).
 
 ## Versioning
 
-Our versioning strategy is based on [Semantic Versioning](http://semver.org/).
+Our versioning strategy is based on [Semantic Versioning](https://semver.org/).
 
 ### Major Release (vX)
 
@@ -14,8 +13,7 @@ backward-incompatible way -- for example, when removing deprecated interfaces.
 
 Our public API includes (but is not limited to):
 
-*   The VTGate [RPC interfaces]
-    (https://github.com/vitessio/vitess/tree/master/proto).
+*   The VTGate [RPC interfaces](https://github.com/vitessio/vitess/tree/master/proto).
 *   The interfaces exposed by the VTGate client library in each language.
 
 Care must also be taken when changing the format of any data stored by a live
@@ -62,8 +60,7 @@ and tag the following items under it:
 
 ## Release Branches
 
-Each minor release level (X.Y) should have a [release branch]
-(https://github.com/vitessio/vitess/branches/all?query=release) named
+Each minor release level (X.Y) should have a [release branch](https://github.com/vitessio/vitess/branches/all?query=release) named
 `release-X.Y`. This branch should diverge from `master` when the code freeze for
 that release is declared, after which point only bugfix PRs should be
 cherrypicked onto the branch. All other activity on `master` will go out with a
@@ -193,13 +190,13 @@ Therefore, file a JIRA ticket with Sonatype to get added ([example for a differe
 
 **Set up GPG**
 
-Follow [Sonatype's GPG instructions](http://central.sonatype.org/pages/working-with-pgp-signatures.html).
+Follow [Sonatype's GPG instructions](https://central.sonatype.org/pages/working-with-pgp-signatures.html).
 
 Install `gpg-agent` (needed below) e.g. on Ubuntu via: `sudo apt-get install gnupg-agent`
 
 **Login configuration**
 
-Create the `settings.xml` in the `$HOME/.m2/` directory as described in their [instructions](http://central.sonatype.org/pages/apache-maven.html).
+Create the `settings.xml` in the `$HOME/.m2/` directory as described in their [instructions](https://central.sonatype.org/pages/apache-maven.html).
 
 ### Deploy & Release
 
@@ -261,8 +258,7 @@ git push upstream vX.Y.Z
 notes. Use the GitHub [Compare](https://github.com/vitessio/vitess/compare) tool
 to see all the commits since the last release.
 
-Then send an announcement on the [vitess-announce]
-(https://groups.google.com/forum/#!forum/vitess-announce) list.
+Then send an announcement on the [vitess-announce](https://groups.google.com/forum/#!forum/vitess-announce) list.
 
 ## Bump Java SNAPSHOT version
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -27,6 +27,7 @@ import (
 	"sync"
 
 	"github.com/hashicorp/consul/api"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
@@ -66,12 +67,12 @@ func getClientCreds() (creds map[string]*ClientAuthCred, err error) {
 
 	data, err := ioutil.ReadFile(*consulAuthClientStaticFile)
 	if err != nil {
-		err = fmt.Errorf("Failed to read consul_auth_static_file file: %v", err)
+		err = vterrors.Wrapf(err, "Failed to read consul_auth_static_file file")
 		return creds, err
 	}
 
 	if err := json.Unmarshal(data, &creds); err != nil {
-		err = fmt.Errorf(fmt.Sprintf("Error parsing consul_auth_static_file: %v", err))
+		err = vterrors.Wrapf(err, fmt.Sprintf("Error parsing consul_auth_static_file")) //nolint
 		return creds, err
 	}
 	return creds, nil
@@ -110,11 +111,14 @@ func NewServer(cell, serverAddr, root string) (*Server, error) {
 	}
 	cfg := api.DefaultConfig()
 	cfg.Address = serverAddr
-	if creds != nil && creds[cell] != nil {
-		cfg.Token = creds[cell].ACLToken
-	} else {
-		log.Warningf("Client auth not configured for cell: %v", cell)
+	if creds != nil {
+		if creds[cell] != nil {
+			cfg.Token = creds[cell].ACLToken
+		} else {
+			log.Warningf("Client auth not configured for cell: %v", cell)
+		}
 	}
+
 	client, err := api.NewClient(cfg)
 	if err != nil {
 		return nil, err

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 package dbconfigs
 
-// This file contains logic for a plugable credentials system.
+// This file contains logic for a pluggable credentials system.
 // The default implementation is file based.
 // The flags are global, but only programs that need to access the database
 // link with this library, so we should be safe.
@@ -26,7 +26,10 @@ import (
 	"errors"
 	"flag"
 	"io/ioutil"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/log"
@@ -37,7 +40,7 @@ var (
 	dbCredentialsServer = flag.String("db-credentials-server", "file", "db credentials server type (use 'file' for the file implementation)")
 
 	// 'file' implementation flags
-	dbCredentialsFile = flag.String("db-credentials-file", "", "db credentials file")
+	dbCredentialsFile = flag.String("db-credentials-file", "", "db credentials file; send SIGHUP to reload this file")
 
 	// ErrUnknownUser is returned by credential server when the
 	// user doesn't exist
@@ -110,7 +113,7 @@ func (fcs *FileCredentialsServer) GetUserAndPassword(user string) (string, strin
 
 // WithCredentials returns a copy of the provided ConnParams that we can use
 // to connect, after going through the CredentialsServer.
-func WithCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
+func withCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
 	result := *cp
 	user, passwd, err := GetCredentialsServer().GetUserAndPassword(cp.Uname)
 	switch err {
@@ -126,4 +129,16 @@ func WithCredentials(cp *mysql.ConnParams) (*mysql.ConnParams, error) {
 
 func init() {
 	AllCredentialsServers["file"] = &FileCredentialsServer{}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP)
+	go func() {
+		for range sigChan {
+			if fcs, ok := AllCredentialsServers["file"].(*FileCredentialsServer); ok {
+				fcs.mu.Lock()
+				fcs.dbCredentials = nil
+				fcs.mu.Unlock()
+			}
+		}
+	}()
 }

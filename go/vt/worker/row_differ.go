@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"time"
 
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"golang.org/x/net/context"
@@ -127,11 +128,11 @@ func NewRowDiffer2(ctx context.Context, left, right ResultReader, td *tabletmana
 
 func compareFields(left, right []*querypb.Field) error {
 	if len(left) != len(right) {
-		return fmt.Errorf("Cannot diff inputs with different number of fields: left: %v right: %v", left, right)
+		return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "cannot diff inputs with different number of fields: left: %v right: %v", left, right)
 	}
 	for i, field := range left {
 		if field.Type != right[i].Type {
-			return fmt.Errorf("Cannot diff inputs with different types: field %v types are %v and %v", i, field.Type, right[i].Type)
+			return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "cannot diff inputs with different types: field %v types are %v and %v", i, field.Type, right[i].Type)
 		}
 	}
 	return nil
@@ -164,11 +165,11 @@ func (rd *RowDiffer2) Diff() (DiffReport, error) {
 			}
 			advanceRight = false
 		}
-		dr.processedRows++
 		if left == nil && right == nil {
 			// No more rows from either side. We're done.
 			break
 		}
+		dr.processedRows++
 		if left == nil {
 			// No more rows on the left side.
 			// We know we have at least one row on the right side left.
@@ -364,5 +365,5 @@ func (rr *RowRouter) Route(row []sqltypes.Value) (int, error) {
 			return i, nil
 		}
 	}
-	return -1, fmt.Errorf("no shard's key range includes the keyspace id: %v for the row: %#v", k, row)
+	return -1, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "no shard's key range includes the keyspace id: %v for the row: %#v", k, row)
 }

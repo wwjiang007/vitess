@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,25 +24,13 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/logutil"
-	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topotools"
-	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
-
-// fakeStats implements TargetStats.
-type fakeStats struct{}
-
-func (s *fakeStats) GetAggregateStats(target *querypb.Target) (*querypb.AggregateStats, queryservice.QueryService, error) {
-	return &querypb.AggregateStats{}, nil, nil
-}
-
-func (s *fakeStats) GetMasterCell(keyspace, shard string) (cell string, qs queryservice.QueryService, err error) {
-	return "", nil, nil
-}
 
 func initResolver(t *testing.T, name string) *Resolver {
 	ctx := context.Background()
@@ -63,12 +51,6 @@ func initResolver(t *testing.T, name string) *Resolver {
 		if err := ts.CreateShard(ctx, "sks", shard); err != nil {
 			t.Fatalf("CreateShard(\"%v\") failed: %v", shard, err)
 		}
-		if _, err := ts.UpdateShardFields(ctx, "sks", shard, func(si *topo.ShardInfo) error {
-			si.Shard.Cells = []string{"cell1"}
-			return nil
-		}); err != nil {
-			t.Fatalf("UpdateShardFields(\"%v\") failed: %v", shard, err)
-		}
 	}
 
 	// Create unsharded keyspace and shard.
@@ -78,12 +60,6 @@ func initResolver(t *testing.T, name string) *Resolver {
 	if err := ts.CreateShard(ctx, "uks", "0"); err != nil {
 		t.Fatalf("CreateShard(0) failed: %v", err)
 	}
-	if _, err := ts.UpdateShardFields(ctx, "uks", "0", func(si *topo.ShardInfo) error {
-		si.Shard.Cells = []string{"cell1"}
-		return nil
-	}); err != nil {
-		t.Fatalf("UpdateShardFields(0) failed: %v", err)
-	}
 
 	// And rebuild both.
 	for _, keyspace := range []string{"sks", "uks"} {
@@ -92,7 +68,7 @@ func initResolver(t *testing.T, name string) *Resolver {
 		}
 	}
 
-	return NewResolver(rs, &fakeStats{}, cell)
+	return NewResolver(rs, &tabletconntest.FakeQueryService{}, cell)
 }
 
 func TestResolveDestinations(t *testing.T) {

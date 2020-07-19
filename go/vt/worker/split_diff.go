@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ limitations under the License.
 package worker
 
 import (
-	"fmt"
 	"html/template"
 	"sort"
 	"sync"
 
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"golang.org/x/net/context"
@@ -96,6 +96,8 @@ func (sdw *SplitDiffWorker) StatusAsHTML() template.HTML {
 	switch state {
 	case WorkerStateDiff:
 		result += "<b>Running...</b></br>\n"
+	case WorkerStateDiffWillFail:
+		result += "<b>Running - have already found differences...</b></br>\n"
 	case WorkerStateDone:
 		result += "<b>Success.</b></br>\n"
 	}
@@ -112,6 +114,8 @@ func (sdw *SplitDiffWorker) StatusAsText() string {
 	switch state {
 	case WorkerStateDiff:
 		result += "Running...\n"
+	case WorkerStateDiffWillFail:
+		result += "Running - have already found differences...\n"
 	case WorkerStateDone:
 		result += "Success.\n"
 	}
@@ -127,13 +131,13 @@ func (sdw *SplitDiffWorker) Run(ctx context.Context) error {
 	cerr := sdw.cleaner.CleanUp(sdw.wr)
 	if cerr != nil {
 		if err != nil {
-			sdw.wr.Logger().Errorf("CleanUp failed in addition to job error: %v", cerr)
+			sdw.wr.Logger().Errorf2(cerr, "CleanUp failed in addition to job error")
 		} else {
 			err = cerr
 		}
 	}
 	if err != nil {
-		sdw.wr.Logger().Errorf("Run() error: %v", err)
+		sdw.wr.Logger().Errorf2(err, "Run() error")
 		sdw.SetState(WorkerStateError)
 		return err
 	}
@@ -197,13 +201,13 @@ func (sdw *SplitDiffWorker) init(ctx context.Context) error {
 	}
 
 	if len(sdw.shardInfo.SourceShards) == 0 {
-		return fmt.Errorf("shard %v/%v has no source shard", sdw.keyspace, sdw.shard)
+		return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "shard %v/%v has no source shard", sdw.keyspace, sdw.shard)
 	}
 	if sdw.sourceUID == 0 {
 		if len(sdw.shardInfo.SourceShards) == 1 {
 			sdw.sourceShard = sdw.shardInfo.SourceShards[0]
 		} else {
-			return fmt.Errorf("shard %v/%v has more than one source, please specify a source UID", sdw.keyspace, sdw.shard)
+			return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "shard %v/%v has more than one source, please specify a source UID", sdw.keyspace, sdw.shard)
 		}
 	} else {
 		for _, ss := range sdw.shardInfo.SourceShards {
@@ -214,11 +218,11 @@ func (sdw *SplitDiffWorker) init(ctx context.Context) error {
 		}
 	}
 	if sdw.sourceShard == nil {
-		return fmt.Errorf("shard %v/%v has no source shard with UID %v", sdw.keyspace, sdw.shard, sdw.sourceUID)
+		return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "shard %v/%v has no source shard with UID %v", sdw.keyspace, sdw.shard, sdw.sourceUID)
 	}
 
 	if !sdw.shardInfo.HasMaster() {
-		return fmt.Errorf("shard %v/%v has no master", sdw.keyspace, sdw.shard)
+		return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "shard %v/%v has no master", sdw.keyspace, sdw.shard)
 	}
 
 	return nil
@@ -258,7 +262,7 @@ func (sdw *SplitDiffWorker) findTargets(ctx context.Context) error {
 	for {
 		select {
 		case <-shortCtx.Done():
-			return fmt.Errorf("Could not find healthy table for %v/%v%v: after: %v, aborting", sdw.cell, sdw.keyspace, sdw.sourceShard.Shard, *remoteActionsTimeout)
+			return vterrors.Errorf(vtrpc.Code_ABORTED, "could not find healthy table for %v/%v%v: after: %v, aborting", sdw.cell, sdw.keyspace, sdw.sourceShard.Shard, *remoteActionsTimeout)
 		default:
 			sdw.sourceAlias, err = FindWorkerTablet(ctx, sdw.wr, sdw.cleaner, nil /* tsc */, sdw.cell, sdw.keyspace, sdw.sourceShard.Shard, sdw.minHealthyRdonlyTablets, topodatapb.TabletType_RDONLY)
 			if err != nil {
@@ -278,13 +282,13 @@ func (sdw *SplitDiffWorker) findTargets(ctx context.Context) error {
 // 2 - stop the source tablet at a binlog position higher than the
 //   destination master. Get that new list of positions.
 //   (add a cleanup task to restart binlog replication on the source tablet, and
-//    change the existing ChangeSlaveType cleanup action to 'spare' type)
+//    change the existing ChangeTabletType cleanup action to 'spare' type)
 // 3 - ask the master of the destination shard to resume filtered replication
 //   up to the new list of positions, and return its binlog position.
 // 4 - wait until the destination tablet is equal or passed that master
 //   binlog position, and stop its replication.
 //   (add a cleanup task to restart binlog replication on it, and change
-//    the existing ChangeSlaveType cleanup action to 'spare' type)
+//    the existing ChangeTabletType cleanup action to 'spare' type)
 // 5 - restart filtered replication on the destination master.
 //   (remove the cleanup task that does the same)
 // At this point, the source and the destination tablet are stopped at the same
@@ -311,16 +315,16 @@ func (sdw *SplitDiffWorker) synchronizeReplication(ctx context.Context) error {
 	wrangler.RecordVReplicationAction(sdw.cleaner, masterInfo.Tablet, binlogplayer.StartVReplication(sdw.sourceShard.Uid))
 	p3qr, err := sdw.wr.TabletManagerClient().VReplicationExec(shortCtx, masterInfo.Tablet, binlogplayer.ReadVReplicationPos(sdw.sourceShard.Uid))
 	if err != nil {
-		return vterrors.Wrapf(err, "VReplicationExec(stop) for %v failed", sdw.shardInfo.MasterAlias)
+		return vterrors.Wrapf(err, "ReadVReplicationPos for %v failed", sdw.shardInfo.MasterAlias)
 	}
 	qr := sqltypes.Proto3ToResult(p3qr)
 	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
-		return fmt.Errorf("Unexpected result while reading position: %v", qr)
+		return vterrors.Errorf(vtrpc.Code_INTERNAL, "unexpected result while reading position: %v", qr)
 	}
 	vreplicationPos := qr.Rows[0][0].ToString()
 
 	// 2 - stop replication
-	sdw.wr.Logger().Infof("Stopping slave %v at a minimum of %v", sdw.sourceAlias, vreplicationPos)
+	sdw.wr.Logger().Infof("Stopping replica %v at a minimum of %v", sdw.sourceAlias, vreplicationPos)
 	// read the tablet
 	sourceTablet, err := sdw.wr.TopoServer().GetTablet(shortCtx, sdw.sourceAlias)
 	if err != nil {
@@ -329,14 +333,14 @@ func (sdw *SplitDiffWorker) synchronizeReplication(ctx context.Context) error {
 
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
-	mysqlPos, err := sdw.wr.TabletManagerClient().StopSlaveMinimum(shortCtx, sourceTablet.Tablet, vreplicationPos, *remoteActionsTimeout)
+	mysqlPos, err := sdw.wr.TabletManagerClient().StopReplicationMinimum(shortCtx, sourceTablet.Tablet, vreplicationPos, *remoteActionsTimeout)
 	if err != nil {
-		return vterrors.Wrapf(err, "cannot stop slave %v at right binlog position %v", sdw.sourceAlias, vreplicationPos)
+		return vterrors.Wrapf(err, "cannot stop replica %v at right binlog position %v", sdw.sourceAlias, vreplicationPos)
 	}
 
-	// change the cleaner actions from ChangeSlaveType(rdonly)
-	// to StartSlave() + ChangeSlaveType(spare)
-	wrangler.RecordStartSlaveAction(sdw.cleaner, sourceTablet.Tablet)
+	// change the cleaner actions from ChangeTabletType(rdonly)
+	// to StartReplication() + ChangeTabletType(spare)
+	wrangler.RecordStartReplicationAction(sdw.cleaner, sourceTablet.Tablet)
 
 	// 3 - ask the master of the destination shard to resume filtered
 	//     replication up to the new list of positions
@@ -366,16 +370,16 @@ func (sdw *SplitDiffWorker) synchronizeReplication(ctx context.Context) error {
 	}
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
-	if _, err = sdw.wr.TabletManagerClient().StopSlaveMinimum(shortCtx, destinationTablet.Tablet, masterPos, *remoteActionsTimeout); err != nil {
-		return vterrors.Wrapf(err, "StopSlaveMinimum for %v at %v failed", sdw.destinationAlias, masterPos)
+	if _, err = sdw.wr.TabletManagerClient().StopReplicationMinimum(shortCtx, destinationTablet.Tablet, masterPos, *remoteActionsTimeout); err != nil {
+		return vterrors.Wrapf(err, "StopReplicationMinimum for %v at %v failed", sdw.destinationAlias, masterPos)
 	}
-	wrangler.RecordStartSlaveAction(sdw.cleaner, destinationTablet.Tablet)
+	wrangler.RecordStartReplicationAction(sdw.cleaner, destinationTablet.Tablet)
 
 	// 5 - restart filtered replication on destination master
 	sdw.wr.Logger().Infof("Restarting filtered replication on master %v", sdw.shardInfo.MasterAlias)
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
-	if _, err = sdw.wr.TabletManagerClient().VReplicationExec(ctx, masterInfo.Tablet, binlogplayer.StartVReplication(sdw.sourceShard.Uid)); err != nil {
+	if _, err = sdw.wr.TabletManagerClient().VReplicationExec(shortCtx, masterInfo.Tablet, binlogplayer.StartVReplication(sdw.sourceShard.Uid)); err != nil {
 		return vterrors.Wrapf(err, "VReplicationExec(start) failed for %v", sdw.shardInfo.MasterAlias)
 	}
 
@@ -400,7 +404,9 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 		sdw.destinationSchemaDefinition, err = sdw.wr.GetSchema(
 			shortCtx, sdw.destinationAlias, nil /* tables */, sdw.excludeTables, false /* includeViews */)
 		cancel()
-		rec.RecordError(err)
+		if err != nil {
+			sdw.markAsWillFail(rec, err)
+		}
 		sdw.wr.Logger().Infof("Got schema from destination %v", sdw.destinationAlias)
 		wg.Done()
 	}()
@@ -411,7 +417,9 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 		sdw.sourceSchemaDefinition, err = sdw.wr.GetSchema(
 			shortCtx, sdw.sourceAlias, nil /* tables */, sdw.excludeTables, false /* includeViews */)
 		cancel()
-		rec.RecordError(err)
+		if err != nil {
+			sdw.markAsWillFail(rec, err)
+		}
 		sdw.wr.Logger().Infof("Got schema from source %v", sdw.sourceAlias)
 		wg.Done()
 	}()
@@ -438,7 +446,7 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 			return vterrors.Wrapf(err, "cannot load VSchema for keyspace %v", sdw.keyspace)
 		}
 		if kschema == nil {
-			return fmt.Errorf("no VSchema for keyspace %v", sdw.keyspace)
+			return vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "no VSchema for keyspace %v", sdw.keyspace)
 		}
 
 		keyspaceSchema, err = vindexes.BuildKeyspaceSchema(kschema, sdw.keyspace)
@@ -495,8 +503,8 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 			}
 			if err != nil {
 				newErr := vterrors.Wrap(err, "TableScan(ByKeyRange?)(source) failed")
-				rec.RecordError(newErr)
-				sdw.wr.Logger().Errorf("%v", newErr)
+				sdw.markAsWillFail(rec, newErr)
+				sdw.wr.Logger().Error(newErr)
 				return
 			}
 			defer sourceQueryResultReader.Close(ctx)
@@ -511,8 +519,8 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 			}
 			if err != nil {
 				newErr := vterrors.Wrap(err, "TableScan(ByKeyRange?)(destination) failed")
-				rec.RecordError(newErr)
-				sdw.wr.Logger().Errorf("%v", newErr)
+				sdw.markAsWillFail(rec, newErr)
+				sdw.wr.Logger().Error(newErr)
 				return
 			}
 			defer destinationQueryResultReader.Close(ctx)
@@ -521,21 +529,21 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 			differ, err := NewRowDiffer(sourceQueryResultReader, destinationQueryResultReader, tableDefinition)
 			if err != nil {
 				newErr := vterrors.Wrap(err, "NewRowDiffer() failed")
-				rec.RecordError(newErr)
-				sdw.wr.Logger().Errorf("%v", newErr)
+				sdw.markAsWillFail(rec, newErr)
+				sdw.wr.Logger().Error(newErr)
 				return
 			}
 
 			// And run the diff.
 			report, err := differ.Go(sdw.wr.Logger())
 			if err != nil {
-				newErr := fmt.Errorf("Differ.Go failed: %v", err.Error())
-				rec.RecordError(newErr)
-				sdw.wr.Logger().Errorf("%v", newErr)
+				newErr := vterrors.Wrapf(err, "Differ.Go failed")
+				sdw.markAsWillFail(rec, newErr)
+				sdw.wr.Logger().Error(newErr)
 			} else {
 				if report.HasDifferences() {
-					err := fmt.Errorf("Table %v has differences: %v", tableDefinition.Name, report.String())
-					rec.RecordError(err)
+					err := vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "table %v has differences: %v", tableDefinition.Name, report.String())
+					sdw.markAsWillFail(rec, err)
 					sdw.wr.Logger().Warningf(err.Error())
 				} else {
 					sdw.wr.Logger().Infof("Table %v checks out (%v rows processed, %v qps)", tableDefinition.Name, report.processedRows, report.processingQPS)
@@ -548,4 +556,10 @@ func (sdw *SplitDiffWorker) diff(ctx context.Context) error {
 	wg.Wait()
 
 	return rec.Error()
+}
+
+// markAsWillFail records the error and changes the state of the worker to reflect this
+func (sdw *SplitDiffWorker) markAsWillFail(er concurrency.ErrorRecorder, err error) {
+	er.RecordError(err)
+	sdw.SetState(WorkerStateDiffWillFail)
 }

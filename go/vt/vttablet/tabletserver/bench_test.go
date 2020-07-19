@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,9 +55,10 @@ func init() {
 }
 
 func BenchmarkExecuteVarBinary(b *testing.B) {
-	db := setUpTabletServerTest(nil)
+	db, tsv := setupTabletServerTest(nil)
 	defer db.Close()
-	testUtils := newTestUtils()
+	defer tsv.StopService()
+
 	// sql that will be executed in this test
 	bv := map[string]*querypb.BindVariable{
 		"vtg1": sqltypes.Int64BindVariable(1),
@@ -66,27 +67,20 @@ func BenchmarkExecuteVarBinary(b *testing.B) {
 		bv[fmt.Sprintf("vtg%d", i)] = sqltypes.BytesBindVariable(benchVarValue)
 	}
 
-	config := testUtils.newQueryServiceConfig()
-	tsv := NewTabletServerWithNilTopoServer(config)
-	dbconfigs := testUtils.newDBConfigs(db)
 	target := querypb.Target{TabletType: topodatapb.TabletType_MASTER}
-	if err := tsv.StartService(target, dbconfigs); err != nil {
-		panic(err)
-	}
-	defer tsv.StopService()
-
 	db.AllowAll = true
 	for i := 0; i < b.N; i++ {
-		if _, err := tsv.Execute(context.Background(), &target, benchQuery, bv, 0, nil); err != nil {
+		if _, err := tsv.Execute(context.Background(), &target, benchQuery, bv, 0, 0, nil); err != nil {
 			panic(err)
 		}
 	}
 }
 
 func BenchmarkExecuteExpression(b *testing.B) {
-	db := setUpTabletServerTest(nil)
+	db, tsv := setupTabletServerTest(nil)
 	defer db.Close()
-	testUtils := newTestUtils()
+	defer tsv.StopService()
+
 	// sql that will be executed in this test
 	bv := map[string]*querypb.BindVariable{
 		"vtg1": sqltypes.Int64BindVariable(1),
@@ -98,18 +92,10 @@ func BenchmarkExecuteExpression(b *testing.B) {
 		}
 	}
 
-	config := testUtils.newQueryServiceConfig()
-	tsv := NewTabletServerWithNilTopoServer(config)
-	dbconfigs := testUtils.newDBConfigs(db)
 	target := querypb.Target{TabletType: topodatapb.TabletType_MASTER}
-	if err := tsv.StartService(target, dbconfigs); err != nil {
-		panic(err)
-	}
-	defer tsv.StopService()
-
 	db.AllowAll = true
 	for i := 0; i < b.N; i++ {
-		if _, err := tsv.Execute(context.Background(), &target, benchQuery, bv, 0, nil); err != nil {
+		if _, err := tsv.Execute(context.Background(), &target, benchQuery, bv, 0, 0, nil); err != nil {
 			panic(err)
 		}
 	}

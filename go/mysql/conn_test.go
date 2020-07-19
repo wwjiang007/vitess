@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func createSocketPair(t *testing.T) (net.Listener, *Conn, *Conn) {
@@ -33,33 +34,35 @@ func createSocketPair(t *testing.T) (net.Listener, *Conn, *Conn) {
 		t.Fatalf("Listen failed: %v", err)
 	}
 	addr := listener.Addr().String()
+	listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second))
 
 	// Dial a client, Accept a server.
 	wg := sync.WaitGroup{}
 
 	var clientConn net.Conn
+	var clientErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var err error
-		clientConn, err = net.Dial("tcp", addr)
-		if err != nil {
-			t.Fatalf("Dial failed: %v", err)
-		}
+		clientConn, clientErr = net.DialTimeout("tcp", addr, 10*time.Second)
 	}()
 
 	var serverConn net.Conn
+	var serverErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var err error
-		serverConn, err = listener.Accept()
-		if err != nil {
-			t.Fatalf("Accept failed: %v", err)
-		}
+		serverConn, serverErr = listener.Accept()
 	}()
 
 	wg.Wait()
+
+	if clientErr != nil {
+		t.Fatalf("Dial failed: %v", clientErr)
+	}
+	if serverErr != nil {
+		t.Fatalf("Accept failed: %v", serverErr)
+	}
 
 	// Create a Conn on both sides.
 	cConn := newConn(clientConn)
@@ -74,7 +77,12 @@ func useWritePacket(t *testing.T, cConn *Conn, data []byte) {
 			t.Fatalf("%v", x)
 		}
 	}()
-	if err := cConn.writePacket(data); err != nil {
+
+	dataLen := len(data)
+	dataWithHeader := make([]byte, packetHeaderSize+dataLen)
+	copy(dataWithHeader[packetHeaderSize:], data)
+
+	if err := cConn.writePacket(dataWithHeader); err != nil {
 		t.Fatalf("writePacket failed: %v", err)
 	}
 }
@@ -86,10 +94,10 @@ func useWriteEphemeralPacketBuffered(t *testing.T, cConn *Conn, data []byte) {
 		}
 	}()
 	cConn.startWriterBuffering()
-	defer cConn.flush()
+	defer cConn.endWriterBuffering()
 
-	buf := cConn.startEphemeralPacket(len(data))
-	copy(buf, data)
+	buf, pos := cConn.startEphemeralPacketWithHeader(len(data))
+	copy(buf[pos:], data)
 	if err := cConn.writeEphemeralPacket(); err != nil {
 		t.Fatalf("writeEphemeralPacket(false) failed: %v", err)
 	}
@@ -102,8 +110,8 @@ func useWriteEphemeralPacketDirect(t *testing.T, cConn *Conn, data []byte) {
 		}
 	}()
 
-	buf := cConn.startEphemeralPacket(len(data))
-	copy(buf, data)
+	buf, pos := cConn.startEphemeralPacketWithHeader(len(data))
+	copy(buf[pos:], data)
 	if err := cConn.writeEphemeralPacket(); err != nil {
 		t.Fatalf("writeEphemeralPacket(true) failed: %v", err)
 	}
@@ -168,6 +176,10 @@ func TestPackets(t *testing.T) {
 	// Verify all packets go through correctly.
 	// Small one.
 	data := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	verifyPacketComms(t, cConn, sConn, data)
+
+	// 0 length packet
+	data = []byte{}
 	verifyPacketComms(t, cConn, sConn, data)
 
 	// Under the limit, still one packet.

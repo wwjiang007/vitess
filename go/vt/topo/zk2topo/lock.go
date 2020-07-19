@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ limitations under the License.
 package zk2topo
 
 import (
-	"fmt"
 	"path"
 
-	"github.com/samuel/go-zookeeper/zk"
+	"github.com/z-division/go-zookeeper/zk"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
@@ -56,12 +56,15 @@ func (zs *Server) Lock(ctx context.Context, dirPath, contents string) (topo.Lock
 		case context.Canceled:
 			errToReturn = topo.NewError(topo.Interrupted, nodePath)
 		default:
-			errToReturn = fmt.Errorf("failed to obtain action lock: %v %v", nodePath, err)
+			errToReturn = vterrors.Wrapf(err, "failed to obtain action lock: %v", nodePath)
 		}
 
 		// Regardless of the reason, try to cleanup.
 		log.Warningf("Failed to obtain action lock: %v", err)
-		zs.conn.Delete(ctx, nodePath, -1)
+
+		if err := zs.conn.Delete(ctx, nodePath, -1); err != nil {
+			log.Warningf("Failed to close connection :%v", err)
+		}
 
 		// Show the other locks in the directory
 		dir := path.Dir(nodePath)

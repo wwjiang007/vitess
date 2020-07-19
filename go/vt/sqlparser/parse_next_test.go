@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -139,7 +139,7 @@ func TestParseNextEdgeCases(t *testing.T) {
 		input: "select 1 from a; update a set b = 2   ;   ",
 		want:  []string{"select 1 from a", "update a set b = 2"},
 	}, {
-		name:  "Handle ForceEOF statements",
+		name:  "Handle SkipToEnd statements",
 		input: "set character set utf8; select 1 from a",
 		want:  []string{"set charset 'utf8'", "select 1 from a"},
 	}, {
@@ -203,11 +203,11 @@ func TestParseNextStrictNonStrict(t *testing.T) {
 
 	// Now try again with strict parsing and observe the expected error.
 	tokens = NewStringTokenizer(input)
-	tree, err := ParseNextStrictDDL(tokens)
+	_, err := ParseNextStrictDDL(tokens)
 	if err == nil || !strings.Contains(err.Error(), "ignore") {
-		t.Fatalf("ParseNext(%q) err = %q, want nil", input, err)
+		t.Fatalf("ParseNext(%q) err = %q, want ignore", input, err)
 	}
-	tree, err = ParseNextStrictDDL(tokens)
+	tree, err := ParseNextStrictDDL(tokens)
 	if err != nil {
 		t.Fatalf("ParseNext(%q) err = %q, want nil", input, err)
 	}

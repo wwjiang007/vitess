@@ -1,7 +1,7 @@
 ###################################
 # vtctld Service + Deployment
 ###################################
-{{- define "vtctld" -}}
+{{ define "vtctld" -}}
 # set tuple values to more recognizable variables
 {{- $topology := index . 0 -}}
 {{- $cell := index . 1 -}}
@@ -13,7 +13,7 @@
 
 # define image to use
 {{- $vitessTag := .vitessTag | default $defaultVtctld.vitessTag -}}
-{{- $cellClean := include "clean-label" $cell.name -}}
+{{- $cellClean := include "clean-label" $cell.name }}
 
 ###################################
 # vtctld Service
@@ -36,10 +36,39 @@ spec:
     app: vitess
   type: {{.serviceType | default $defaultVtctld.serviceType}}
 ---
+
+###################################
+# vtctld ServiceAccount
+###################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vtctld
+  labels:
+    app: vitess
+---
+
+###################################
+# vtctld RoleBinding
+###################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vtctld-topo-member
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vt-topo-member
+subjects:
+- kind: ServiceAccount
+  name: vtctld
+  namespace: {{ $namespace }}
+---
+
 ###################################
 # vtctld Service + Deployment
 ###################################
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vtctld
@@ -55,11 +84,13 @@ spec:
         app: vitess
         component: vtctld
     spec:
+      serviceAccountName: vtctld
 {{ include "pod-security" . | indent 6 }}
 {{ include "vtctld-affinity" (tuple $cellClean $cell.region) | indent 6 }}
       containers:
         - name: vtctld
           image: vitess/vtctld:{{$vitessTag}}
+          imagePullPolicy: IfNotPresent
           readinessProbe:
             httpGet:
               path: /debug/health
@@ -76,7 +107,7 @@ spec:
 {{ include "backup-env" $config.backup | indent 12 }}
           volumeMounts:
 {{ include "backup-volumeMount" $config.backup | indent 12 }}
-
+{{ include "user-secret-volumeMounts" (.secrets | default $defaultVtctld.secrets) | indent 12 }}
           resources:
 {{ toYaml (.resources | default $defaultVtctld.resources) | indent 12 }}
           command:
@@ -98,15 +129,23 @@ spec:
                 -port=15000
                 -grpc_port=15999
                 -service_map="grpc-vtctl"
+                -topo_global_root=/vitess/global
+                -proxy_tablets=true
+                {{- if eq ($cell.topologyProvider | default "") "etcd2" }}
                 -topo_implementation="etcd2"
                 -topo_global_server_address="etcd-global-client.{{ $namespace }}:2379"
-                -topo_global_root=/vitess/global
+                {{- else }}
+                -topo_implementation="k8s"
+                -topo_global_server_address="k8s"
+                {{- end }}
 {{ include "backup-flags" (tuple $config.backup "vtctld") | indent 16 }}
+{{ include "format-flags-all" (tuple $defaultVtctld.extraFlags .extraFlags) | indent 16 }}
               END_OF_COMMAND
               )
 
       volumes:
 {{ include "backup-volume" $config.backup | indent 8 }}
+{{ include "user-secret-volumes" (.secrets | default $defaultVtctld.secrets) | indent 8 }}
 
 {{- end -}}
 {{- end -}}
@@ -114,7 +153,7 @@ spec:
 ###################################
 # vtctld-affinity sets node/pod affinities
 ###################################
-{{- define "vtctld-affinity" -}}
+{{ define "vtctld-affinity" -}}
 # set tuple values to more recognizable variables
 {{- $cellClean := index . 0 -}}
 {{- $region := index . 1 -}}

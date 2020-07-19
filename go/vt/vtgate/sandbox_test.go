@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,12 +43,14 @@ const (
 	KsTestSharded             = "TestSharded"
 	KsTestUnsharded           = "TestUnsharded"
 	KsTestUnshardedServedFrom = "TestUnshardedServedFrom"
+	KsTestBadVSchema          = "TestXBadVSchema"
 )
 
 func init() {
 	ksToSandbox = make(map[string]*sandbox)
 	createSandbox(KsTestSharded)
 	createSandbox(KsTestUnsharded)
+	createSandbox(KsTestBadVSchema)
 	tabletconn.RegisterDialer("sandbox", sandboxDialer)
 	flag.Set("tablet_protocol", "sandbox")
 }
@@ -85,13 +87,6 @@ func getSandboxSrvVSchema() *vschemapb.SrvVSchema {
 		result.Keyspaces[keyspace] = &vs
 	}
 	return result
-}
-
-func addSandboxServedFrom(keyspace, servedFrom string) {
-	sandboxMu.Lock()
-	defer sandboxMu.Unlock()
-	ksToSandbox[keyspace].KeyspaceServedFrom = servedFrom
-	ksToSandbox[servedFrom] = ksToSandbox[keyspace]
 }
 
 type sandbox struct {
@@ -233,12 +228,12 @@ func newSandboxForCells(cells []string) *sandboxTopo {
 }
 
 // GetTopoServer is part of the srvtopo.Server interface
-func (sct *sandboxTopo) GetTopoServer() *topo.Server {
-	return sct.topoServer
+func (sct *sandboxTopo) GetTopoServer() (*topo.Server, error) {
+	return sct.topoServer, nil
 }
 
 // GetSrvKeyspaceNames is part of the srvtopo.Server interface.
-func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
+func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
 	sandboxMu.Lock()
 	defer sandboxMu.Unlock()
 	keyspaces := make([]string, 0, 1)
@@ -251,6 +246,9 @@ func (sct *sandboxTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([
 // GetSrvKeyspace is part of the srvtopo.Server interface.
 func (sct *sandboxTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error) {
 	sand := getSandbox(keyspace)
+	if sand == nil {
+		return nil, fmt.Errorf("topo error GetSrvKeyspace")
+	}
 	sand.sandmu.Lock()
 	defer sand.sandmu.Unlock()
 	if sand.SrvKeyspaceCallback != nil {

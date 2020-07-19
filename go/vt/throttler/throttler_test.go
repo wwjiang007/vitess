@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -134,12 +134,9 @@ func BenchmarkThrottlerDisabled(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		for {
-			backoff := throttler.Throttle(0)
-			if backoff != NotThrottled {
-				b.Fatalf("unthrottled throttler should never have throttled us: %v", backoff)
-			}
-			break
+		backoff := throttler.Throttle(0)
+		if backoff != NotThrottled {
+			b.Fatalf("unthrottled throttler should never have throttled us: %v", backoff)
 		}
 	}
 }

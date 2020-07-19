@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,6 +52,7 @@ var (
 				<th>RowsAffected</th>
 				<th>Response Size</th>
 				<th>Transaction ID</th>
+				<th>Reserved ID</th>
 				<th>Error</th>
 			</tr>
 		</thead>
@@ -80,6 +81,7 @@ var (
 			<td>{{.RowsAffected}}</td>
 			<td>{{.SizeOfResponse}}</td>
 			<td>{{.TransactionID}}</td>
+			<td>{{.ReservedID}}</td>
 			<td>{{.ErrorStr}}</td>
 		</tr>
 	`))

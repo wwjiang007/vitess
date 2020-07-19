@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -27,11 +27,11 @@ import (
 
 	"golang.org/x/net/context"
 
-	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 )
 
 func compactJSON(in []byte) string {
@@ -51,17 +51,28 @@ func TestAPI(t *testing.T) {
 	// Populate topo. Remove ServedTypes from shards to avoid ordering issues.
 	ts.CreateKeyspace(ctx, "ks1", &topodatapb.Keyspace{ShardingColumnName: "shardcol"})
 	ts.CreateShard(ctx, "ks1", "-80")
-	ts.UpdateShardFields(ctx, "ks1", "-80", func(si *topo.ShardInfo) error {
-		si.Shard.Cells = cells
-		si.Shard.ServedTypes = nil
-		return nil
-	})
 	ts.CreateShard(ctx, "ks1", "80-")
-	ts.UpdateShardFields(ctx, "ks1", "80-", func(si *topo.ShardInfo) error {
-		si.Shard.Cells = cells
-		si.Shard.ServedTypes = nil
-		return nil
-	})
+
+	// SaveVSchema to test that creating a snapshot keyspace copies VSchema
+	vs := &vschemapb.Keyspace{
+		Sharded: true,
+		Vindexes: map[string]*vschemapb.Vindex{
+			"name1": {
+				Type: "hash",
+			},
+		},
+		Tables: map[string]*vschemapb.Table{
+			"table1": {
+				ColumnVindexes: []*vschemapb.ColumnVindex{
+					{
+						Column: "column1",
+						Name:   "name1",
+					},
+				},
+			},
+		},
+	}
+	ts.SaveVSchema(ctx, "ks1", vs)
 
 	tablet1 := topodatapb.Tablet{
 		Alias:    &topodatapb.TabletAlias{Cell: "cell1", Uid: 100},
@@ -119,15 +130,24 @@ func TestAPI(t *testing.T) {
 	table := []struct {
 		method, path, body, want string
 	}{
+		// Create snapshot keyspace using API
+		{"POST", "vtctl/", `["CreateKeyspace", "-keyspace_type=SNAPSHOT", "-base_keyspace=ks1", "-snapshot_time=2006-01-02T15:04:05+00:00", "ks3"]`, `{
+		   "Error": "",
+		   "Output": ""
+		}`},
+
 		// Cells
 		{"GET", "cells", "", `["cell1","cell2"]`},
 
 		// Keyspaces
-		{"GET", "keyspaces", "", `["ks1"]`},
+		{"GET", "keyspaces", "", `["ks1", "ks3"]`},
 		{"GET", "keyspaces/ks1", "", `{
 				"sharding_column_name": "shardcol",
 				"sharding_column_type": 0,
-				"served_froms": []
+				"served_froms": [],
+                                "keyspace_type":0,
+                                "base_keyspace":"",
+                                "snapshot_time":null
 			}`},
 		{"GET", "keyspaces/nonexistent", "", "404 page not found"},
 		{"POST", "keyspaces/ks1?action=TestKeyspaceAction", "", `{
@@ -141,14 +161,15 @@ func TestAPI(t *testing.T) {
 		{"GET", "shards/ks1/", "", `["-80","80-"]`},
 		{"GET", "shards/ks1/-80", "", `{
 				"master_alias": null,
+				"master_term_start_time":null,
 				"key_range": {
 					"start": null,
 					"end":"gA=="
 				},
 				"served_types": [],
 				"source_shards": [],
-				"cells": ["cell1", "cell2"],
-				"tablet_controls": []
+				"tablet_controls": [],
+				"is_master_serving": true
 			}`},
 		{"GET", "shards/ks1/-DEAD", "", "404 page not found"},
 		{"POST", "shards/ks1/-80?action=TestShardAction", "", `{
@@ -172,19 +193,14 @@ func TestAPI(t *testing.T) {
 		{"GET", "tablets/?shard=ks1%2F80-&cell=cell1", "", `[]`},
 		{"GET", "tablets/cell1-100", "", `{
 				"alias": {"cell": "cell1", "uid": 100},
-				"hostname": "",
 				"port_map": {"vt": 100},
 				"keyspace": "ks1",
 				"shard": "-80",
 				"key_range": {
-					"start": null,
 					"end": "gA=="
 				},
 				"type": 2,
-				"db_name_override": "",
-				"tags": {},
-				"mysql_hostname":"",
-				"mysql_port":0
+				"url":"http://:100"
 			}`},
 		{"GET", "tablets/nonexistent-999", "", "404 page not found"},
 		{"POST", "tablets/cell1-100?action=TestTabletAction", "", `{
@@ -247,7 +263,7 @@ func TestAPI(t *testing.T) {
 		  "Name": "", "Target": { "keyspace": "ks1", "shard": "-80", "tablet_type": 2 }, "Up": true, "Serving": true, "TabletExternallyReparentedTimestamp": 0,
 		  "Stats": { "seconds_behind_master": 100 }, "LastError": null }`},
 		{"GET", "tablet_health/cell1", "", "can't get tablet_health: invalid tablet_health path: \"cell1\"  expected path: /tablet_health/<cell>/<uid>"},
-		{"GET", "tablet_health/cell1/gh", "", "can't get tablet_health: incorrect uid: bad tablet uid strconv.ParseUint: parsing \"gh\": invalid syntax"},
+		{"GET", "tablet_health/cell1/gh", "", "can't get tablet_health: incorrect uid"},
 
 		// Topology Info
 		{"GET", "topology_info/?keyspace=all&cell=all", "", `{
@@ -264,7 +280,15 @@ func TestAPI(t *testing.T) {
 		// vtctl RunCommand
 		{"POST", "vtctl/", `["GetKeyspace","ks1"]`, `{
 		   "Error": "",
-		   "Output": "{\n  \"sharding_column_name\": \"shardcol\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [\n  ]\n}\n\n"
+		   "Output": "{\n  \"sharding_column_name\": \"shardcol\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [\n  ],\n  \"keyspace_type\": 0,\n  \"base_keyspace\": \"\",\n  \"snapshot_time\": null\n}\n\n"
+		}`},
+		{"POST", "vtctl/", `["GetKeyspace","ks3"]`, `{
+		   "Error": "",
+		   "Output": "{\n  \"sharding_column_name\": \"\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [\n  ],\n  \"keyspace_type\": 1,\n  \"base_keyspace\": \"ks1\",\n  \"snapshot_time\": {\n    \"seconds\": \"1136214245\",\n    \"nanoseconds\": 0\n  }\n}\n\n"
+		}`},
+		{"POST", "vtctl/", `["GetVSchema","ks3"]`, `{
+		   "Error": "",
+		   "Output": "{\n  \"sharded\": true,\n  \"vindexes\": {\n    \"name1\": {\n      \"type\": \"hash\"\n    }\n  },\n  \"tables\": {\n    \"table1\": {\n      \"columnVindexes\": [\n        {\n          \"column\": \"column1\",\n          \"name\": \"name1\"\n        }\n      ]\n    }\n  },\n  \"requireExplicitRouting\": true\n}\n\n"
 		}`},
 		{"POST", "vtctl/", `["GetKeyspace","does_not_exist"]`, `{
 			"Error": "node doesn't exist: keyspaces/does_not_exist/Keyspace",
@@ -273,43 +297,46 @@ func TestAPI(t *testing.T) {
 		{"POST", "vtctl/", `["Panic"]`, `uncaught panic: this command panics on purpose`},
 	}
 	for _, in := range table {
-		var resp *http.Response
-		var err error
+		t.Run(in.method+in.path, func(t *testing.T) {
+			var resp *http.Response
+			var err error
 
-		switch in.method {
-		case "GET":
-			resp, err = http.Get(server.URL + apiPrefix + in.path)
-		case "POST":
-			resp, err = http.Post(server.URL+apiPrefix+in.path, "application/json", strings.NewReader(in.body))
-		default:
-			t.Errorf("[%v] unknown method: %v", in.path, in.method)
-			continue
-		}
+			switch in.method {
+			case "GET":
+				resp, err = http.Get(server.URL + apiPrefix + in.path)
+			case "POST":
+				resp, err = http.Post(server.URL+apiPrefix+in.path, "application/json", strings.NewReader(in.body))
+			default:
+				t.Fatalf("[%v] unknown method: %v", in.path, in.method)
+				return
+			}
 
-		if err != nil {
-			t.Errorf("[%v] http error: %v", in.path, err)
-			continue
-		}
+			if err != nil {
+				t.Fatalf("[%v] http error: %v", in.path, err)
+				return
+			}
 
-		body, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
 
-		if err != nil {
-			t.Errorf("[%v] ioutil.ReadAll(resp.Body) error: %v", in.path, err)
-			continue
-		}
+			if err != nil {
+				t.Fatalf("[%v] ioutil.ReadAll(resp.Body) error: %v", in.path, err)
+				return
+			}
 
-		got := compactJSON(body)
-		want := compactJSON([]byte(in.want))
-		if want == "" {
-			// want is not valid JSON. Fallback to a string comparison.
-			want = in.want
-			// For unknown reasons errors have a trailing "\n\t\t". Remove it.
-			got = strings.TrimSpace(string(body))
-		}
-		if got != want {
-			t.Errorf("[%v] got\n'%v', want\n'%v'", in.path, got, want)
-			continue
-		}
+			got := compactJSON(body)
+			want := compactJSON([]byte(in.want))
+			if want == "" {
+				// want is not valid JSON. Fallback to a string comparison.
+				want = in.want
+				// For unknown reasons errors have a trailing "\n\t\t". Remove it.
+				got = strings.TrimSpace(string(body))
+			}
+			if !strings.HasPrefix(got, want) {
+				t.Fatalf("For path [%v] got\n'%v', want\n'%v'", in.path, got, want)
+				return
+			}
+		})
+
 	}
 }

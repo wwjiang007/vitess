@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package planbuilder
 
 import (
 	"errors"
+	"fmt"
 
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vtgate/engine"
@@ -35,18 +36,16 @@ var _ builder = (*subquery)(nil)
 // clause, because a route is more versatile than
 // a subquery.
 type subquery struct {
-	order         int
+	builderCommon
 	resultColumns []*resultColumn
-	input         builder
 	esubquery     *engine.Subquery
 }
 
 // newSubquery builds a new subquery.
-func newSubquery(alias sqlparser.TableIdent, bldr builder) (*subquery, *symtab) {
+func newSubquery(alias sqlparser.TableIdent, bldr builder) (*subquery, *symtab, error) {
 	sq := &subquery{
-		order:     bldr.Order() + 1,
-		input:     bldr,
-		esubquery: &engine.Subquery{},
+		builderCommon: newBuilderCommon(bldr),
+		esubquery:     &engine.Subquery{},
 	}
 
 	// Create a 'table' that represents the subquery.
@@ -56,37 +55,28 @@ func newSubquery(alias sqlparser.TableIdent, bldr builder) (*subquery, *symtab) 
 	}
 
 	// Create column symbols based on the result column names.
-	cols := make(map[string]*column)
-	for i, rc := range bldr.ResultColumns() {
-		cols[rc.alias.Lowered()] = &column{
-			origin: sq,
-			colnum: i,
+	for _, rc := range bldr.ResultColumns() {
+		if _, ok := t.columns[rc.alias.Lowered()]; ok {
+			return nil, nil, fmt.Errorf("duplicate column names in subquery: %s", sqlparser.String(rc.alias))
 		}
+		t.addColumn(rc.alias, &column{origin: sq})
 	}
-
-	// Populate the table with those columns and add it to symtab.
-	t.columns = cols
+	t.isAuthoritative = true
 	st := newSymtab()
 	// AddTable will not fail because symtab is empty.
 	_ = st.AddTable(t)
-	return sq, st
-}
-
-// Order satisfies the builder interface.
-func (sq *subquery) Order() int {
-	return sq.order
-}
-
-// Reorder satisfies the builder interface.
-func (sq *subquery) Reorder(order int) {
-	sq.input.Reorder(order)
-	sq.order = sq.input.Order() + 1
+	return sq, st, nil
 }
 
 // Primitive satisfies the builder interface.
 func (sq *subquery) Primitive() engine.Primitive {
 	sq.esubquery.Subquery = sq.input.Primitive()
 	return sq.esubquery
+}
+
+// PushLock satisfies the builder interface.
+func (sq *subquery) PushLock(lock string) error {
+	return sq.input.PushLock(lock)
 }
 
 // First satisfies the builder interface.
@@ -105,14 +95,14 @@ func (sq *subquery) PushFilter(_ *primitiveBuilder, _ sqlparser.Expr, whereType 
 }
 
 // PushSelect satisfies the builder interface.
-func (sq *subquery) PushSelect(expr *sqlparser.AliasedExpr, _ builder) (rc *resultColumn, colnum int, err error) {
+func (sq *subquery) PushSelect(_ *primitiveBuilder, expr *sqlparser.AliasedExpr, _ builder) (rc *resultColumn, colNumber int, err error) {
 	col, ok := expr.Expr.(*sqlparser.ColName)
 	if !ok {
 		return nil, 0, errors.New("unsupported: expression on results of a cross-shard subquery")
 	}
 
-	// colnum should already be set for subquery columns.
-	inner := col.Metadata.(*column).colnum
+	// colNumber should already be set for subquery columns.
+	inner := col.Metadata.(*column).colNumber
 	sq.esubquery.Cols = append(sq.esubquery.Cols, inner)
 
 	// Build a new column reference to represent the result column.
@@ -122,39 +112,29 @@ func (sq *subquery) PushSelect(expr *sqlparser.AliasedExpr, _ builder) (rc *resu
 	return rc, len(sq.resultColumns) - 1, nil
 }
 
-// PushOrderByNull satisfies the builder interface.
-func (sq *subquery) PushOrderByNull() {
+// MakeDistinct satisfies the builder interface.
+func (sq *subquery) MakeDistinct() error {
+	return errors.New("unsupported: distinct on cross-shard subquery")
 }
 
-// PushOrderByRand satisfies the builder interface.
-func (sq *subquery) PushOrderByRand() {
+// PushGroupBy satisfies the builder interface.
+func (sq *subquery) PushGroupBy(groupBy sqlparser.GroupBy) error {
+	if (groupBy) == nil {
+		return nil
+	}
+	return errors.New("unsupported: group by on cross-shard subquery")
 }
 
-// SetUpperLimit satisfies the builder interface.
-// For now, the call is ignored because the
-// repercussions of pushing this limit down
-// into a subquery have not been studied yet.
-// We can consider doing it in the future.
-// TODO(sougou): this could be improved.
-func (sq *subquery) SetUpperLimit(_ *sqlparser.SQLVal) {
-}
-
-// PushMisc satisfies the builder interface.
-func (sq *subquery) PushMisc(sel *sqlparser.Select) {
-}
-
-// Wireup satisfies the builder interface.
-func (sq *subquery) Wireup(bldr builder, jt *jointab) error {
-	return sq.input.Wireup(bldr, jt)
-}
-
-// SupplyVar satisfies the builder interface.
-func (sq *subquery) SupplyVar(from, to int, col *sqlparser.ColName, varname string) {
-	sq.input.SupplyVar(from, to, col, varname)
+// PushOrderBy satisfies the builder interface.
+func (sq *subquery) PushOrderBy(orderBy sqlparser.OrderBy) (builder, error) {
+	if len(orderBy) == 0 {
+		return sq, nil
+	}
+	return newMemorySort(sq, orderBy)
 }
 
 // SupplyCol satisfies the builder interface.
-func (sq *subquery) SupplyCol(col *sqlparser.ColName) (rc *resultColumn, colnum int) {
+func (sq *subquery) SupplyCol(col *sqlparser.ColName) (rc *resultColumn, colNumber int) {
 	c := col.Metadata.(*column)
 	for i, rc := range sq.resultColumns {
 		if rc.column == c {
@@ -162,9 +142,9 @@ func (sq *subquery) SupplyCol(col *sqlparser.ColName) (rc *resultColumn, colnum 
 		}
 	}
 
-	// columns that reference subqueries will have their colnum set.
+	// columns that reference subqueries will have their colNumber set.
 	// Let's use it here.
-	sq.esubquery.Cols = append(sq.esubquery.Cols, c.colnum)
+	sq.esubquery.Cols = append(sq.esubquery.Cols, c.colNumber)
 	sq.resultColumns = append(sq.resultColumns, &resultColumn{column: c})
 	return rc, len(sq.resultColumns) - 1
 }

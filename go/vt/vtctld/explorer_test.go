@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -141,7 +141,7 @@ func TestHandlePathShard(t *testing.T) {
 	input := path.Join("/global", "keyspaces", "test_keyspace", "shards", "-80", "Shard")
 	cells := []string{"cell1", "cell2", "cell3"}
 	keyspace := &topodatapb.Keyspace{}
-	want := "cells: \"cell1\"\ncells: \"cell2\"\ncells: \"cell3\"\n"
+	want := "is_master_serving: true\n"
 
 	ctx := context.Background()
 	ts := memorytopo.NewServer(cells...)
@@ -153,8 +153,6 @@ func TestHandlePathShard(t *testing.T) {
 	}
 	if _, err := ts.UpdateShardFields(ctx, "test_keyspace", "-80", func(si *topo.ShardInfo) error {
 		// Set cells, reset other fields so printout is easier to compare.
-		si.Shard.Cells = cells
-		si.ServedTypes = nil
 		si.KeyRange = nil
 		return nil
 	}); err != nil {

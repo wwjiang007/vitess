@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,14 +19,15 @@ package vtworkerclient
 
 import (
 	"flag"
-	"fmt"
 
 	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
-// protocol specifices which RPC client implementation should be used.
+// protocol specifics which RPC client implementation should be used.
 var protocol = flag.String("vtworker_client_protocol", "grpc", "the protocol to use to talk to the vtworker server")
 
 // Client defines the interface used to send remote vtworker commands
@@ -67,7 +68,7 @@ func UnregisterFactoryForTest(name string) {
 func New(addr string) (Client, error) {
 	factory, ok := factories[*protocol]
 	if !ok {
-		return nil, fmt.Errorf("unknown vtworker client protocol: %v", *protocol)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "unknown vtworker client protocol: %v", *protocol)
 	}
 	return factory(addr)
 }

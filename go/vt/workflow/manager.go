@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -170,9 +170,7 @@ func (m *Manager) Run(ctx context.Context) {
 	m.mu.Unlock()
 
 	// Wait for the context to be canceled.
-	select {
-	case <-ctx.Done():
-	}
+	<-ctx.Done()
 
 	// Clear context and get a copy of the running jobs.
 	m.mu.Lock()
@@ -187,9 +185,7 @@ func (m *Manager) Run(ctx context.Context) {
 		rw.cancel()
 	}
 	for _, rw := range runningWorkflows {
-		select {
-		case <-rw.done:
-		}
+		<-rw.done
 	}
 }
 
@@ -331,7 +327,7 @@ func (m *Manager) Start(ctx context.Context, uuid string) error {
 
 	rw, ok := m.workflows[uuid]
 	if !ok {
-		return fmt.Errorf("Cannot find workflow %v in the workflow list", uuid)
+		return fmt.Errorf("cannot find workflow %v in the workflow list", uuid)
 	}
 
 	if rw.wi.State != workflowpb.WorkflowState_NotStarted {
@@ -446,10 +442,10 @@ func (m *Manager) Delete(ctx context.Context, uuid string) error {
 
 	rw, ok := m.workflows[uuid]
 	if !ok {
-		return fmt.Errorf("No workflow with uuid %v", uuid)
+		return fmt.Errorf("no workflow with uuid %v", uuid)
 	}
 	if rw.wi.State == workflowpb.WorkflowState_Running {
-		return fmt.Errorf("Cannot delete running workflow")
+		return fmt.Errorf("cannot delete running workflow")
 	}
 	if err := m.ts.DeleteWorkflow(m.ctx, rw.wi); err != nil {
 		log.Errorf("Could not delete workflow %v: %v", rw.wi, err)

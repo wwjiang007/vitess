@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string,
 		// If the shard already has sources, maybe it's already been restored,
 		// so let's be safe and abort right here.
 		if len(si.SourceShards) > 0 {
-			return fmt.Errorf("Shard %v/%v already has SourceShards, not overwriting them (full record: %v)", keyspace, shard, *si.Shard)
+			return fmt.Errorf("shard %v/%v already has SourceShards, not overwriting them (full record: %v)", keyspace, shard, *si.Shard)
 		}
 
 		si.SourceShards = sourceShards

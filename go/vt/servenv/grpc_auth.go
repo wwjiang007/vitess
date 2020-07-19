@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"vitess.io/vitess/go/vt/log"
 )
@@ -57,7 +58,7 @@ func FakeAuthStreamInterceptor(srv interface{}, stream grpc.ServerStream, info *
 	if fakeDummyAuthenticate(stream.Context()) {
 		return handler(srv, stream)
 	}
-	return grpc.Errorf(codes.Unauthenticated, "username and password must be provided")
+	return status.Errorf(codes.Unauthenticated, "username and password must be provided")
 }
 
 // FakeAuthUnaryInterceptor fake interceptor to test plugin
@@ -65,7 +66,7 @@ func FakeAuthUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.U
 	if fakeDummyAuthenticate(ctx) {
 		return handler(ctx, req)
 	}
-	return nil, grpc.Errorf(codes.Unauthenticated, "username and password must be provided")
+	return nil, status.Errorf(codes.Unauthenticated, "username and password must be provided")
 }
 
 func fakeDummyAuthenticate(ctx context.Context) bool {

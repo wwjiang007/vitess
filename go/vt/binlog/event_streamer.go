@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
@@ -51,7 +52,7 @@ type EventStreamer struct {
 }
 
 // NewEventStreamer returns a new EventStreamer on top of a Streamer
-func NewEventStreamer(cp *mysql.ConnParams, se *schema.Engine, startPos mysql.Position, timestamp int64, sendEvent sendEventFunc) *EventStreamer {
+func NewEventStreamer(cp dbconfigs.Connector, se *schema.Engine, startPos mysql.Position, timestamp int64, sendEvent sendEventFunc) *EventStreamer {
 	evs := &EventStreamer{
 		sendEvent: sendEvent,
 	}
@@ -168,7 +169,7 @@ func (evs *EventStreamer) buildDMLStatement(stmt FullBinlogStatement, insertid i
 	}
 
 	// then parse the PK values, one at a time
-	for typ, val = tokenizer.Scan(); typ != ';'; typ, val = tokenizer.Scan() {
+	for typ, _ = tokenizer.Scan(); typ != ';'; typ, _ = tokenizer.Scan() {
 		switch typ {
 		case '(':
 			// pkTuple is a list of pk values

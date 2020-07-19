@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ type SQLError struct {
 
 // NewSQLError creates a new SQLError.
 // If sqlState is left empty, it will default to "HY000" (general error).
+// TODO: Should be aligned with vterrors, stack traces and wrapping
 func NewSQLError(number int, sqlState string, format string, args ...interface{}) *SQLError {
 	if sqlState == "" {
 		sqlState = SSUnknownSQLState

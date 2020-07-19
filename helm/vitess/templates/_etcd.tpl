@@ -1,12 +1,13 @@
 ###################################
 # etcd cluster managed by pre-installed etcd operator
 ###################################
-{{- define "etcd" -}}
+{{ define "etcd" -}}
 # set tuple values to more recognizable variables
 {{- $name := index . 0 -}}
 {{- $replicas := index . 1 -}}
 {{- $version := index . 2 -}}
-{{- $resources := index . 3 -}}
+{{- $resources := index . 3 }}
+{{- $clusterWide := index . 4 }}
 
 ###################################
 # EtcdCluster
@@ -15,6 +16,12 @@ apiVersion: "etcd.database.coreos.com/v1beta2"
 kind: "EtcdCluster"
 metadata:
   name: "etcd-{{ $name }}"
+  ## Adding this annotation make this cluster managed by clusterwide operators
+  ## namespaced operators ignore it
+  annotations:
+  {{ if $clusterWide }}
+    etcd.database.coreos.com/scope: clusterwide
+  {{ end }}
 spec:
   size: {{ $replicas }}
   version: {{ $version | quote }}

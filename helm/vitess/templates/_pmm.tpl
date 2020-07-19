@@ -1,10 +1,10 @@
 ###################################
 # pmm Service + Deployment
 ###################################
-{{- define "pmm" -}}
+{{ define "pmm" -}}
 # set tuple values to more recognizable variables
 {{- $pmm := index . 0 -}}
-{{- $namespace := index . 1 -}}
+{{- $namespace := index . 1 }}
 
 ###################################
 # pmm Service
@@ -29,14 +29,14 @@ spec:
 ###################################
 # pmm StatefulSet
 ###################################
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: pmm
 spec:
   serviceName: pmm
   replicas: 1
-  updateStrategy: 
+  updateStrategy:
     type: RollingUpdate
   selector:
     matchLabels:
@@ -65,7 +65,7 @@ spec:
 
           env:
             - name: DISABLE_UPDATES
-              value: "false"
+              value: "true"
 
             - name: DISABLE_TELEMETRY
               value: {{ $pmm.server.env.disableTelemetry | quote }}
@@ -81,7 +81,7 @@ spec:
 
             - name: METRICS_MEMORY
               value: {{ $pmm.server.env.metricsMemory | quote }}
-        
+
           command: ["bash"]
           args:
             - "-c"
@@ -115,7 +115,7 @@ spec:
               ln -s /pmmdata/consul-data /opt/
               ln -s /pmmdata/mysql /var/lib/
               ln -s /pmmdata/grafana /var/lib/
-              
+
               /opt/entrypoint.sh
 
   volumeClaimTemplates:
@@ -131,9 +131,10 @@ spec:
 ###################################
 # sidecar container running pmm-client
 ###################################
-{{- define "cont-pmm-client" -}}
+{{ define "cont-pmm-client" -}}
 {{- $pmm := index . 0 -}}
 {{- $namespace := index . 1 -}}
+{{- $keyspace := index . 2 }}
 
 - name: "pmm-client"
   image: "vitess/pmm-client:{{ $pmm.pmmTag }}"
@@ -141,6 +142,11 @@ spec:
   volumeMounts:
     - name: vtdataroot
       mountPath: "/vtdataroot"
+{{ if $keyspace.pmm }}{{if $keyspace.pmm.config }}
+    - name: config
+      mountPath: "/vt-pmm-config"
+{{ end }}{{ end }}
+
   ports:
     - containerPort: 42001
       name: query-data
@@ -160,25 +166,64 @@ spec:
     - |
       set -ex
 
-      mkdir -p /vtdataroot/pmm
+      # Redirect pmm-client data to persistent volume
+      if [ ! -d /vtdataroot/pmm ]; then
+        FIRST_RUN=1
+        mkdir -p /vtdataroot/pmm/percona
+        mkdir -p /vtdataroot/pmm/init.d
+      fi
 
-      # redirect logs to PV
+      mv /usr/local/percona /usr/local/percona_tmp
+      mv /etc/init.d /etc/init.d_tmp
+      ln -s /vtdataroot/pmm/percona /usr/local/percona
+      ln -s /vtdataroot/pmm/init.d /etc/init.d
       ln -s /vtdataroot/pmm/pmm-mysql-metrics-42002.log /var/log/pmm-mysql-metrics-42002.log
 
-      # --force is used because the pod ip address may have changed
-      pmm-admin config --server pmm.{{ $namespace }} --force
+      if [ ! -z "$FIRST_RUN" ]; then
+        cp -r /usr/local/percona_tmp/* /vtdataroot/pmm/percona || :
+        cp -r /etc/init.d_tmp/* /vtdataroot/pmm/init.d || :
+      fi
 
-      # creates a systemd service
-      # TODO: remove "|| true" after https://jira.percona.com/projects/PMM/issues/PMM-1985 is resolved
-      pmm-admin add mysql:metrics --user root --socket /vtdataroot/tabletdata/mysql.sock --force || true
+{{ if $keyspace.pmm }}{{if $keyspace.pmm.config }}
+      # link all the configmap files into their expected file locations
+      for filename in /vt-pmm-config/*; do
+        DEST_FILE=/vtdataroot/pmm/percona/pmm-client/$(basename "$filename")
+        rm -f $DEST_FILE
+        ln -s "$filename" $DEST_FILE
+      done
+{{ end }}{{ end }}
+
+      # if this doesn't return an error, pmm-admin has already been configured
+      # and we want to stop/remove running services, in case pod ips have changed
+      if pmm-admin info; then
+        pmm-admin stop --all
+        pmm-admin repair
+        pmm-admin rm --all
+      fi
+
+      pmm-admin config --server pmm.{{ $namespace }} --bind-address `hostname -I` --client-address ${HOSTNAME}.vttablet --force
+      pmm-admin repair
+
+      # wait for mysql to be available before registering
+      until [ -e /vtdataroot/tabletdata/mysql.sock ]; do
+        echo "Waiting for mysql.sock file"
+        sleep 1
+      done
+
+      # creates systemd services
+      pmm-admin add linux:metrics
+      pmm-admin add mysql:metrics --user root --socket /vtdataroot/tabletdata/mysql.sock --force
+      pmm-admin add mysql:queries --user root --socket /vtdataroot/tabletdata/mysql.sock --force --query-source=perfschema
 
       # keep the container alive but still responsive to stop requests
       trap : TERM INT; sleep infinity & wait
 
 - name: pmm-client-metrics-log
-  image: busybox
-  command: ["/bin/sh"]
-  args: ["-c", "tail -n+1 -F /vtdataroot/pmm/pmm-mysql-metrics-42002.log"]
+  image: vitess/logtail:helm-2.0.0-0
+  imagePullPolicy: IfNotPresent
+  env:
+  - name: TAIL_FILEPATH
+    value: /vtdataroot/pmm/pmm-mysql-metrics-42002.log
   volumeMounts:
     - name: vtdataroot
       mountPath: /vtdataroot

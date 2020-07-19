@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@ import (
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/mvcc/mvccpb"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
@@ -54,7 +56,10 @@ func (s *Server) newUniqueEphemeralKV(ctx context.Context, cli *clientv3.Client,
 			// succeeded or not. In any case, let's try to
 			// delete the node, so we don't leave an orphan
 			// node behind for *leaseTTL time.
-			cli.Delete(context.Background(), newKey)
+
+			if _, err := cli.Delete(context.Background(), newKey); err != nil {
+				log.Errorf("cli.Delete(context.Background(), newKey) failed :%v", err)
+			}
 		}
 		return "", 0, convertError(err, newKey)
 	}
@@ -88,7 +93,7 @@ func (s *Server) waitOnLastRev(ctx context.Context, cli *clientv3.Client, nodePa
 	defer cancel()
 	wc := cli.Watch(ctx, key, clientv3.WithRev(revision))
 	if wc == nil {
-		return false, fmt.Errorf("Watch failed")
+		return false, vterrors.Errorf(vtrpc.Code_INTERNAL, "Watch failed")
 	}
 
 	select {

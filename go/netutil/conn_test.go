@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors.
+Copyright 2019 The Vitess Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -39,7 +39,7 @@ func createSocketPair(t *testing.T) (net.Listener, net.Conn, net.Conn) {
 		var err error
 		clientConn, err = net.Dial("tcp", addr)
 		if err != nil {
-			t.Fatalf("Dial failed: %v", err)
+			t.Errorf("Dial failed: %v", err)
 		}
 	}()
 
@@ -50,7 +50,7 @@ func createSocketPair(t *testing.T) (net.Listener, net.Conn, net.Conn) {
 		var err error
 		serverConn, err = listener.Accept()
 		if err != nil {
-			t.Fatalf("Accept failed: %v", err)
+			t.Errorf("Accept failed: %v", err)
 		}
 	}()
 

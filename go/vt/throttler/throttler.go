@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -157,7 +157,7 @@ func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxR
 	}
 
 	runningThreads := make(map[int]bool, threadCount)
-	threadThrottlers := make([]*threadThrottler, threadCount, threadCount)
+	threadThrottlers := make([]*threadThrottler, threadCount)
 	for i := 0; i < threadCount; i++ {
 		threadThrottlers[i] = newThreadThrottler(i, actualRateHistory)
 		runningThreads[i] = true
@@ -171,7 +171,7 @@ func newThrottler(manager *managerImpl, name, unit string, threadCount int, maxR
 		maxReplicationLagModule: maxReplicationLagModule,
 		rateUpdateChan:          rateUpdateChan,
 		threadThrottlers:        threadThrottlers,
-		threadFinished:          make([]bool, threadCount, threadCount),
+		threadFinished:          make([]bool, threadCount),
 		runningThreads:          runningThreads,
 		nowFunc:                 nowFunc,
 		actualRateHistory:       actualRateHistory,
@@ -295,7 +295,7 @@ func (t *Throttler) SetMaxRate(rate int64) {
 // RecordReplicationLag must be called by users to report the "ts" tablet health
 // data observed at "time".
 // Note: After Close() is called, this method must not be called anymore.
-func (t *Throttler) RecordReplicationLag(time time.Time, ts *discovery.TabletStats) {
+func (t *Throttler) RecordReplicationLag(time time.Time, ts *discovery.LegacyTabletStats) {
 	t.maxReplicationLagModule.RecordReplicationLag(time, ts)
 }
 

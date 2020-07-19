@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,14 +20,18 @@ import (
 	"fmt"
 	"path"
 	"sync"
+	"time"
 
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"github.com/golang/protobuf/proto"
 	"vitess.io/vitess/go/event"
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/logutil"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/events"
@@ -81,7 +85,7 @@ func IsRunningQueryService(tt topodatapb.TabletType) bool {
 // them as fast as possible.
 //
 // Replica and rdonly will use lameduck when going from healthy to
-// unhealhty (either because health check fails, or they're shutting down).
+// unhealthy (either because health check fails, or they're shutting down).
 //
 // Other types are probably not serving user visible traffic, so they
 // need to transition as fast as possible too.
@@ -103,11 +107,11 @@ func IsRunningUpdateStream(tt topodatapb.TabletType) bool {
 	return false
 }
 
-// IsSlaveType returns if this type should be connected to a master db
+// IsReplicaType returns if this type should be connected to a master db
 // and actively replicating?
 // MASTER is not obviously (only support one level replication graph)
 // BACKUP, RESTORE, DRAINED may or may not be, but we don't know for sure
-func IsSlaveType(tt topodatapb.TabletType) bool {
+func IsReplicaType(tt topodatapb.TabletType) bool {
 	switch tt {
 	case topodatapb.TabletType_MASTER, topodatapb.TabletType_BACKUP, topodatapb.TabletType_RESTORE, topodatapb.TabletType_DRAINED:
 		return false
@@ -180,7 +184,7 @@ func (ti *TabletInfo) Addr() string {
 
 // MysqlAddr returns hostname:mysql port.
 func (ti *TabletInfo) MysqlAddr() string {
-	return netutil.JoinHostPort(topoproto.MysqlHostname(ti.Tablet), topoproto.MysqlPort(ti.Tablet))
+	return netutil.JoinHostPort(ti.Tablet.MysqlHostname, ti.Tablet.MysqlPort)
 }
 
 // DbName is usually implied by keyspace. Having the shard information in the
@@ -200,9 +204,14 @@ func (ti *TabletInfo) IsInServingGraph() bool {
 	return IsInServingGraph(ti.Type)
 }
 
-// IsSlaveType returns if this tablet's type is a slave
-func (ti *TabletInfo) IsSlaveType() bool {
-	return IsSlaveType(ti.Type)
+// IsReplicaType returns if this tablet's type is a slave
+func (ti *TabletInfo) IsReplicaType() bool {
+	return IsReplicaType(ti.Type)
+}
+
+// GetMasterTermStartTime returns the tablet's master term start time as a Time value.
+func (ti *TabletInfo) GetMasterTermStartTime() time.Time {
+	return logutil.ProtoToTime(ti.Tablet.MasterTermStartTime)
 }
 
 // NewTabletInfo returns a TabletInfo basing on tablet with the
@@ -220,8 +229,7 @@ func (ts *Server) GetTablet(ctx context.Context, alias *topodatapb.TabletAlias) 
 		return nil, err
 	}
 
-	span := trace.NewSpanFromContext(ctx)
-	span.StartClient("TopoServer.GetTablet")
+	span, ctx := trace.NewSpan(ctx, "TopoServer.GetTablet")
 	span.Annotate("tablet", topoproto.TabletAliasString(alias))
 	defer span.Finish()
 
@@ -249,8 +257,7 @@ func (ts *Server) UpdateTablet(ctx context.Context, ti *TabletInfo) error {
 		return err
 	}
 
-	span := trace.NewSpanFromContext(ctx)
-	span.StartClient("TopoServer.UpdateTablet")
+	span, ctx := trace.NewSpan(ctx, "TopoServer.UpdateTablet")
 	span.Annotate("tablet", topoproto.TabletAliasString(ti.Alias))
 	defer span.Finish()
 
@@ -279,8 +286,7 @@ func (ts *Server) UpdateTablet(ctx context.Context, ti *TabletInfo) error {
 // If the update method returns ErrNoUpdateNeeded, nothing is written,
 // and nil,nil is returned.
 func (ts *Server) UpdateTabletFields(ctx context.Context, alias *topodatapb.TabletAlias, update func(*topodatapb.Tablet) error) (*topodatapb.Tablet, error) {
-	span := trace.NewSpanFromContext(ctx)
-	span.StartClient("TopoServer.UpdateTabletFields")
+	span, ctx := trace.NewSpan(ctx, "TopoServer.UpdateTabletFields")
 	span.Annotate("tablet", topoproto.TabletAliasString(alias))
 	defer span.Finish()
 
@@ -309,7 +315,7 @@ func Validate(ctx context.Context, ts *Server, tabletAlias *topodatapb.TabletAli
 		return err
 	}
 	if !topoproto.TabletAliasEqual(tablet.Alias, tabletAlias) {
-		return fmt.Errorf("bad tablet alias data for tablet %v: %#v", topoproto.TabletAliasString(tabletAlias), tablet.Alias)
+		return vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "bad tablet alias data for tablet %v: %#v", topoproto.TabletAliasString(tabletAlias), tablet.Alias)
 	}
 
 	// Validate the entry in the shard replication nodes
@@ -319,7 +325,7 @@ func Validate(ctx context.Context, ts *Server, tabletAlias *topodatapb.TabletAli
 	}
 
 	if _, err = si.GetShardReplicationNode(tabletAlias); err != nil {
-		return fmt.Errorf("tablet %v not found in cell %v shard replication: %v", tabletAlias, tablet.Alias.Cell, err)
+		return vterrors.Wrapf(err, "tablet %v not found in cell %v shard replication", tabletAlias, tablet.Alias.Cell)
 	}
 
 	return nil
@@ -403,8 +409,7 @@ func DeleteTabletReplicationData(ctx context.Context, ts *Server, tablet *topoda
 // incomplete, meaning some tablets couldn't be read.
 // The map is indexed by topoproto.TabletAliasString(tablet alias).
 func (ts *Server) GetTabletMap(ctx context.Context, tabletAliases []*topodatapb.TabletAlias) (map[string]*TabletInfo, error) {
-	span := trace.NewSpanFromContext(ctx)
-	span.StartLocal("topo.GetTabletMap")
+	span, ctx := trace.NewSpan(ctx, "topo.GetTabletMap")
 	span.Annotate("num_tablets", len(tabletAliases))
 	defer span.Finish()
 

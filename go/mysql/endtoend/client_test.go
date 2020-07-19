@@ -1,3 +1,19 @@
+/*
+Copyright 2019 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package endtoend
 
 import (
@@ -142,8 +158,10 @@ func TestClientFoundRows(t *testing.T) {
 	}
 }
 
-func TestMultiResult(t *testing.T) {
+func doTestMultiResult(t *testing.T, disableClientDeprecateEOF bool) {
 	ctx := context.Background()
+	connParams.DisableClientDeprecateEOF = disableClientDeprecateEOF
+
 	conn, err := mysql.Connect(ctx, &connParams)
 	expectNoError(t, err)
 	defer conn.Close()
@@ -153,12 +171,12 @@ func TestMultiResult(t *testing.T) {
 	expectFlag(t, "ExecuteMultiFetch(multi result)", more, true)
 	expectRows(t, "ExecuteMultiFetch(multi result)", qr, 1)
 
-	qr, more, err = conn.ReadQueryResult(10, true)
+	qr, more, _, err = conn.ReadQueryResult(10, true)
 	expectNoError(t, err)
 	expectFlag(t, "ReadQueryResult(1)", more, true)
 	expectRows(t, "ReadQueryResult(1)", qr, 0)
 
-	qr, more, err = conn.ReadQueryResult(10, true)
+	qr, more, _, err = conn.ReadQueryResult(10, true)
 	expectNoError(t, err)
 	expectFlag(t, "ReadQueryResult(2)", more, false)
 	expectRows(t, "ReadQueryResult(2)", qr, 1)
@@ -172,6 +190,63 @@ func TestMultiResult(t *testing.T) {
 	expectNoError(t, err)
 	expectFlag(t, "ExecuteMultiFetch(no result)", more, false)
 	expectRows(t, "ExecuteMultiFetch(no result)", qr, 0)
+
+	// The ClientDeprecateEOF protocol change has a subtle twist in which an EOF or OK
+	// packet happens to have the status flags in the same position if the affected_rows
+	// and last_insert_id are both one byte long:
+	//
+	// https://dev.mysql.com/doc/internals/en/packet-EOF_Packet.html
+	// https://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
+	//
+	// It turns out that there are no actual cases in which clients end up needing to make
+	// this distinction. If either affected_rows or last_insert_id are non-zero, the protocol
+	// sends an OK packet unilaterally which is properly parsed. If not, then regardless of the
+	// negotiated version, it can properly send the status flags.
+	//
+	result, err := conn.ExecuteFetch("create table a(id int, name varchar(128), primary key(id))", 0, false)
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	if result.RowsAffected != 0 {
+		t.Errorf("create table returned RowsAffected %v, was expecting 0", result.RowsAffected)
+	}
+
+	for i := 0; i < 255; i++ {
+		result, err := conn.ExecuteFetch(fmt.Sprintf("insert into a(id, name) values(%v, 'nice name %v')", 1000+i, i), 1000, true)
+		if err != nil {
+			t.Fatalf("ExecuteFetch(%v) failed: %v", i, err)
+		}
+		if result.RowsAffected != 1 {
+			t.Errorf("insert into returned RowsAffected %v, was expecting 1", result.RowsAffected)
+		}
+	}
+
+	qr, more, err = conn.ExecuteFetchMulti("update a set name = concat(name, ' updated'); select * from a; select count(*) from a", 300, true)
+	expectNoError(t, err)
+	expectFlag(t, "ExecuteMultiFetch(multi result)", more, true)
+	expectRows(t, "ExecuteMultiFetch(multi result)", qr, 255)
+
+	qr, more, _, err = conn.ReadQueryResult(300, true)
+	expectNoError(t, err)
+	expectFlag(t, "ReadQueryResult(1)", more, true)
+	expectRows(t, "ReadQueryResult(1)", qr, 255)
+
+	qr, more, _, err = conn.ReadQueryResult(300, true)
+	expectNoError(t, err)
+	expectFlag(t, "ReadQueryResult(2)", more, false)
+	expectRows(t, "ReadQueryResult(2)", qr, 1)
+
+	_, err = conn.ExecuteFetch("drop table a", 10, true)
+	if err != nil {
+		t.Fatalf("drop table failed: %v", err)
+	}
+}
+
+func TestMultiResultDeprecateEOF(t *testing.T) {
+	doTestMultiResult(t, false)
+}
+func TestMultiResultNoDeprecateEOF(t *testing.T) {
+	doTestMultiResult(t, true)
 }
 
 func expectNoError(t *testing.T, err error) {
@@ -228,7 +303,7 @@ func TestTLS(t *testing.T) {
 	}
 }
 
-func TestSlaveStatus(t *testing.T) {
+func TestReplicationStatus(t *testing.T) {
 	params := connParams
 	ctx := context.Background()
 	conn, err := mysql.Connect(ctx, &params)
@@ -237,8 +312,8 @@ func TestSlaveStatus(t *testing.T) {
 	}
 	defer conn.Close()
 
-	status, err := conn.ShowSlaveStatus()
-	if err != mysql.ErrNotSlave {
-		t.Errorf("Got unexpected result for ShowSlaveStatus: %v %v", status, err)
+	status, err := conn.ShowReplicationStatus()
+	if err != mysql.ErrNotReplica {
+		t.Errorf("Got unexpected result for ShowReplicationStatus: %v %v", status, err)
 	}
 }

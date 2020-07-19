@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Vitess Authors.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 package stats
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestToKebabCase(t *testing.T) {
 	var kebabCaseTest = []struct{ input, output string }{

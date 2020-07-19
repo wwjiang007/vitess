@@ -1,7 +1,7 @@
 ###################################
 # vtgate Service + Deployment
 ###################################
-{{- define "vtgate" -}}
+{{ define "vtgate" -}}
 # set tuple values to more recognizable variables
 {{- $topology := index . 0 -}}
 {{- $cell := index . 1 -}}
@@ -12,7 +12,7 @@
 
 # define image to use
 {{- $vitessTag := .vitessTag | default $defaultVtgate.vitessTag -}}
-{{- $cellClean := include "clean-label" $cell.name -}}
+{{- $cellClean := include "clean-label" $cell.name }}
 
 ###################################
 # vtgate Service
@@ -41,10 +41,39 @@ spec:
     app: vitess
   type: {{.serviceType | default $defaultVtgate.serviceType}}
 ---
+
+###################################
+# vtgate ServiceAccount
+###################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vtgate
+  labels:
+    app: vitess
+---
+
+###################################
+# vtgate RoleBinding
+###################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vtgate-topo-member
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vt-topo-member
+subjects:
+- kind: ServiceAccount
+  name: vtgate
+  namespace: {{ $namespace }}
+---
+
 ###################################
 # vtgate Deployment
 ###################################
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vtgate-{{ $cellClean }}
@@ -62,17 +91,21 @@ spec:
         component: vtgate
         cell: {{ $cellClean }}
     spec:
+      serviceAccountName: vtgate
 {{ include "pod-security" . | indent 6 }}
 {{ include "vtgate-affinity" (tuple $cellClean $cell.region) | indent 6 }}
 
 {{ if $cell.mysqlProtocol.enabled }}
+{{ if eq $cell.mysqlProtocol.authType "secret" }}
       initContainers:
 {{ include "init-mysql-creds" (tuple $vitessTag $cell) | indent 8 }}
+{{ end }}
 {{ end }}
 
       containers:
         - name: vtgate
           image: vitess/vtgate:{{$vitessTag}}
+          imagePullPolicy: IfNotPresent
           readinessProbe:
             httpGet:
               path: /debug/health
@@ -88,7 +121,7 @@ spec:
           volumeMounts:
             - name: creds
               mountPath: "/mysqlcreds"
-
+{{ include "user-secret-volumeMounts" (.secrets | default $defaultVtgate.secrets) | indent 12 }}
           resources:
 {{ toYaml (.resources | default $defaultVtgate.resources) | indent 12 }}
 
@@ -99,16 +132,26 @@ spec:
               set -ex
 
               eval exec /vt/bin/vtgate $(cat <<END_OF_COMMAND
+                -topo_global_root=/vitess/global
+                {{- if eq ($cell.topologyProvider | default "") "etcd2" }}
                 -topo_implementation=etcd2
                 -topo_global_server_address="etcd-global-client.{{ $namespace }}:2379"
-                -topo_global_root=/vitess/global
+                {{- else }}
+                -topo_implementation="k8s"
+                -topo_global_server_address="k8s"
+                {{- end }}
                 -logtostderr=true
                 -stderrthreshold=0
                 -port=15001
                 -grpc_port=15991
 {{ if $cell.mysqlProtocol.enabled }}
                 -mysql_server_port=3306
+{{ if eq $cell.mysqlProtocol.authType "secret" }}
+                -mysql_auth_server_impl="static"
                 -mysql_auth_server_static_file="/mysqlcreds/creds.json"
+{{ else if eq $cell.mysqlProtocol.authType "none" }}
+                -mysql_auth_server_impl="none"
+{{ end }}
 {{ end }}
                 -service_map="grpc-vtgateservice"
                 -cells_to_watch={{$cell.name | quote}}
@@ -121,7 +164,7 @@ spec:
       volumes:
         - name: creds
           emptyDir: {}
-
+{{ include "user-secret-volumes" (.secrets | default $defaultVtgate.secrets) | indent 8 }}
 ---
 ###################################
 # vtgate PodDisruptionBudget
@@ -150,7 +193,7 @@ metadata:
   name: vtgate-{{ $cellClean }}
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1beta1
+    apiVersion: apps/v1
     kind: Deployment
     name: vtgate-{{ $cellClean }}
   minReplicas: {{ .replicas }}
@@ -168,10 +211,10 @@ spec:
 ###################################
 # vtgate-affinity sets node/pod affinities
 ###################################
-{{- define "vtgate-affinity" -}}
+{{ define "vtgate-affinity" -}}
 # set tuple values to more recognizable variables
 {{- $cellClean := index . 0 -}}
-{{- $region := index . 1 -}}
+{{- $region := index . 1 }}
 
 # affinity pod spec
 affinity:
@@ -205,17 +248,18 @@ affinity:
 
 ###################################
 # init-container to set mysql credentials file
-# it loops through the users and pulls out their 
+# it loops through the users and pulls out their
 # respective passwords from mounted secrets
 ###################################
-{{- define "init-mysql-creds" -}}
+{{ define "init-mysql-creds" -}}
 {{- $vitessTag := index . 0 -}}
 {{- $cell := index . 1 -}}
 
-{{- with $cell.mysqlProtocol -}}
+{{- with $cell.mysqlProtocol }}
 
 - name: init-mysql-creds
   image: "vitess/vtgate:{{$vitessTag}}"
+  imagePullPolicy: IfNotPresent
   volumeMounts:
     - name: creds
       mountPath: "/mysqlcreds"

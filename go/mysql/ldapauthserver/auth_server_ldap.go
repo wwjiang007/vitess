@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -48,7 +48,7 @@ type AuthServerLdap struct {
 	Password       string
 	GroupQuery     string
 	UserDnPattern  string
-	RefreshSeconds time.Duration
+	RefreshSeconds int64
 }
 
 // Init is public so it can be called from plugin_auth_ldap.go (go/cmd/vtgate)
@@ -189,7 +189,7 @@ func (lud *LdapUserData) update() {
 
 // Get returns wrapped username and LDAP groups and possibly updates the cache
 func (lud *LdapUserData) Get() *querypb.VTGateCallerID {
-	if time.Since(lud.lastUpdated) > lud.asl.RefreshSeconds*time.Second {
+	if int64(time.Since(lud.lastUpdated).Seconds()) > lud.asl.RefreshSeconds {
 		go lud.update()
 	}
 	return &querypb.VTGateCallerID{Username: lud.username, Groups: lud.groups}
@@ -221,6 +221,9 @@ type ClientImpl struct {
 // This must be called before any other methods
 func (lci *ClientImpl) Connect(network string, config *ServerConfig) error {
 	conn, err := ldap.Dial(network, config.LdapServer)
+	if err != nil {
+		return err
+	}
 	lci.Conn = conn
 	// Reconnect with TLS ... why don't we simply DialTLS directly?
 	serverName, _, err := netutil.SplitHostPort(config.LdapServer)

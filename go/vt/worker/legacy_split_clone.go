@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -76,13 +76,13 @@ type LegacySplitCloneWorker struct {
 	sourceTablets []*topodatapb.Tablet
 	// healthCheck tracks the health of all MASTER and REPLICA tablets.
 	// It must be closed at the end of the command.
-	healthCheck discovery.HealthCheck
-	tsc         *discovery.TabletStatsCache
-	// destinationShardWatchers contains a TopologyWatcher for each destination
+	healthCheck discovery.LegacyHealthCheck
+	tsc         *discovery.LegacyTabletStatsCache
+	// destinationShardWatchers contains a LegacyTopologyWatcher for each destination
 	// shard. It updates the list of tablets in the healthcheck if replicas are
 	// added/removed.
 	// Each watcher must be stopped at the end of the command.
-	destinationShardWatchers []*discovery.TopologyWatcher
+	destinationShardWatchers []*discovery.LegacyTopologyWatcher
 	// destinationDbNames stores for each destination keyspace/shard the MySQL
 	// database name.
 	// Example Map Entry: test_keyspace/-80 => vt_test_keyspace
@@ -206,7 +206,7 @@ func (scw *LegacySplitCloneWorker) Run(ctx context.Context) error {
 	cerr := scw.cleaner.CleanUp(scw.wr)
 	if cerr != nil {
 		if err != nil {
-			scw.wr.Logger().Errorf("CleanUp failed in addition to job error: %v", cerr)
+			scw.wr.Logger().Errorf2(cerr, "CleanUp failed in addition to job error")
 		} else {
 			err = cerr
 		}
@@ -222,7 +222,7 @@ func (scw *LegacySplitCloneWorker) Run(ctx context.Context) error {
 	}
 	if scw.healthCheck != nil {
 		if err := scw.healthCheck.Close(); err != nil {
-			scw.wr.Logger().Errorf("HealthCheck.Close() failed: %v", err)
+			scw.wr.Logger().Errorf2(err, "LegacyHealthCheck.Close() failed")
 		}
 	}
 
@@ -289,8 +289,13 @@ func (scw *LegacySplitCloneWorker) init(ctx context.Context) error {
 	scw.wr.Logger().Infof("Found overlapping shards: %+v\n", os)
 
 	// one side should have served types, the other one none,
-	// figure out wich is which, then double check them all
-	if len(os.Left[0].ServedTypes) > 0 {
+	// figure out which is which, then double check them all
+
+	leftServingTypes, err := scw.wr.TopoServer().GetShardServingTypes(ctx, os.Left[0])
+	if err != nil {
+		return fmt.Errorf("cannot get shard serving cells for: %v", os.Left[0])
+	}
+	if len(leftServingTypes) > 0 {
 		scw.sourceShards = os.Left
 		scw.destinationShards = os.Right
 	} else {
@@ -311,13 +316,29 @@ func (scw *LegacySplitCloneWorker) init(ctx context.Context) error {
 	servingTypes := []topodatapb.TabletType{topodatapb.TabletType_MASTER, topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY}
 	for _, st := range servingTypes {
 		for _, si := range scw.sourceShards {
-			if si.GetServedType(st) == nil {
+			shardServingTypes, err := scw.wr.TopoServer().GetShardServingTypes(ctx, si)
+			if err != nil {
+				return fmt.Errorf("failed to get ServingTypes for source shard %v/%v", si.Keyspace(), si.ShardName())
+
+			}
+			found := false
+			for _, shardServingType := range shardServingTypes {
+				if shardServingType == st {
+					found = true
+				}
+			}
+			if !found {
 				return fmt.Errorf("source shard %v/%v is not serving type %v", si.Keyspace(), si.ShardName(), st)
 			}
 		}
 	}
 	for _, si := range scw.destinationShards {
-		if len(si.ServedTypes) > 0 {
+		shardServingTypes, err := scw.wr.TopoServer().GetShardServingTypes(ctx, si)
+		if err != nil {
+			return fmt.Errorf("failed to get ServingTypes for destination shard %v/%v", si.Keyspace(), si.ShardName())
+
+		}
+		if len(shardServingTypes) > 0 {
 			return fmt.Errorf("destination shard %v/%v is serving some types", si.Keyspace(), si.ShardName())
 		}
 	}
@@ -355,20 +376,20 @@ func (scw *LegacySplitCloneWorker) findTargets(ctx context.Context) error {
 		scw.sourceTablets[i] = ti.Tablet
 
 		shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
-		err = scw.wr.TabletManagerClient().StopSlave(shortCtx, scw.sourceTablets[i])
+		err = scw.wr.TabletManagerClient().StopReplication(shortCtx, scw.sourceTablets[i])
 		cancel()
 		if err != nil {
 			return fmt.Errorf("cannot stop replication on tablet %v", topoproto.TabletAliasString(alias))
 		}
 
-		wrangler.RecordStartSlaveAction(scw.cleaner, scw.sourceTablets[i])
+		wrangler.RecordStartReplicationAction(scw.cleaner, scw.sourceTablets[i])
 	}
 
 	// Initialize healthcheck and add destination shards to it.
-	scw.healthCheck = discovery.NewHealthCheck(*healthcheckRetryDelay, *healthCheckTimeout)
-	scw.tsc = discovery.NewTabletStatsCache(scw.healthCheck, scw.wr.TopoServer(), scw.cell)
+	scw.healthCheck = discovery.NewLegacyHealthCheck(*healthcheckRetryDelay, *healthCheckTimeout)
+	scw.tsc = discovery.NewLegacyTabletStatsCache(scw.healthCheck, scw.wr.TopoServer(), scw.cell)
 	for _, si := range scw.destinationShards {
-		watcher := discovery.NewShardReplicationWatcher(scw.wr.TopoServer(), scw.healthCheck,
+		watcher := discovery.NewLegacyShardReplicationWatcher(ctx, scw.wr.TopoServer(), scw.healthCheck,
 			scw.cell, si.Keyspace(), si.ShardName(),
 			*healthCheckTopologyRefresh, discovery.DefaultTopoReadConcurrency)
 		scw.destinationShardWatchers = append(scw.destinationShardWatchers, watcher)
@@ -379,12 +400,12 @@ func (scw *LegacySplitCloneWorker) findTargets(ctx context.Context) error {
 	for _, si := range scw.destinationShards {
 		waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer waitCancel()
-		if err := scw.tsc.WaitForTablets(waitCtx, scw.cell, si.Keyspace(), si.ShardName(), topodatapb.TabletType_MASTER); err != nil {
+		if err := scw.tsc.WaitForTablets(waitCtx, si.Keyspace(), si.ShardName(), topodatapb.TabletType_MASTER); err != nil {
 			return vterrors.Wrapf(err, "cannot find MASTER tablet for destination shard for %v/%v", si.Keyspace(), si.ShardName())
 		}
 		masters := scw.tsc.GetHealthyTabletStats(si.Keyspace(), si.ShardName(), topodatapb.TabletType_MASTER)
 		if len(masters) == 0 {
-			return fmt.Errorf("cannot find MASTER tablet for destination shard for %v/%v in HealthCheck: empty TabletStats list", si.Keyspace(), si.ShardName())
+			return fmt.Errorf("cannot find MASTER tablet for destination shard for %v/%v in LegacyHealthCheck: empty LegacyTabletStats list", si.Keyspace(), si.ShardName())
 		}
 		master := masters[0]
 
@@ -400,7 +421,7 @@ func (scw *LegacySplitCloneWorker) findTargets(ctx context.Context) error {
 
 		scw.wr.Logger().Infof("Using tablet %v as destination master for %v/%v", topoproto.TabletAliasString(master.Tablet.Alias), si.Keyspace(), si.ShardName())
 	}
-	scw.wr.Logger().Infof("NOTE: The used master of a destination shard might change over the course of the copy e.g. due to a reparent. The HealthCheck module will track and log master changes and any error message will always refer the actually used master address.")
+	scw.wr.Logger().Infof("NOTE: The used master of a destination shard might change over the course of the copy e.g. due to a reparent. The LegacyHealthCheck module will track and log master changes and any error message will always refer the actually used master address.")
 
 	// Set up the throttler for each destination shard.
 	for _, si := range scw.destinationShards {
@@ -424,7 +445,7 @@ func (scw *LegacySplitCloneWorker) copy(ctx context.Context) error {
 	scw.setState(WorkerStateCloneOffline)
 	start := time.Now()
 	defer func() {
-		statsStateDurationsNs.Set(string(WorkerStateCloneOffline), time.Now().Sub(start).Nanoseconds())
+		statsStateDurationsNs.Set(string(WorkerStateCloneOffline), time.Since(start).Nanoseconds())
 	}()
 
 	// get source schema from the first shard
@@ -585,7 +606,7 @@ func (scw *LegacySplitCloneWorker) copy(ctx context.Context) error {
 	// get the current position from the sources
 	for shardIndex := range scw.sourceShards {
 		shortCtx, cancel := context.WithTimeout(ctx, *remoteActionsTimeout)
-		status, err := scw.wr.TabletManagerClient().SlaveStatus(shortCtx, scw.sourceTablets[shardIndex])
+		status, err := scw.wr.TabletManagerClient().ReplicationStatus(shortCtx, scw.sourceTablets[shardIndex])
 		cancel()
 		if err != nil {
 			return err
@@ -594,10 +615,13 @@ func (scw *LegacySplitCloneWorker) copy(ctx context.Context) error {
 	}
 
 	for _, si := range scw.destinationShards {
+		keyspaceAndShard := topoproto.KeyspaceShardString(si.Keyspace(), si.ShardName())
+		dbName := scw.destinationDbNames[keyspaceAndShard]
+
 		destinationWaitGroup.Add(1)
 		go func(keyspace, shard string, kr *topodatapb.KeyRange) {
 			defer destinationWaitGroup.Done()
-			scw.wr.Logger().Infof("Making and populating vreplication table")
+			scw.wr.Logger().Infof("Making and populating vreplication table for %v/%v", keyspace, shard)
 
 			exc := newExecutor(scw.wr, scw.tsc, nil, keyspace, shard, 0)
 			for shardIndex, src := range scw.sourceShards {
@@ -606,10 +630,12 @@ func (scw *LegacySplitCloneWorker) copy(ctx context.Context) error {
 					Shard:    src.ShardName(),
 					KeyRange: kr,
 				}
-				qr, err := exc.vreplicationExec(ctx, binlogplayer.CreateVReplication("LegacySplitClone", bls, sourcePositions[shardIndex], scw.maxTPS, throttler.ReplicationLagModuleDisabled, time.Now().Unix()))
+				qr, err := exc.vreplicationExec(ctx, binlogplayer.CreateVReplication("LegacySplitClone", bls, sourcePositions[shardIndex], scw.maxTPS, throttler.ReplicationLagModuleDisabled, time.Now().Unix(), dbName))
 				if err != nil {
 					processError("vreplication queries failed: %v", err)
 					break
+				} else {
+					scw.wr.Logger().Infof("Created replication for tablet %v/%v: %v, db: %v, pos: %v, uid: %v", keyspace, shard, bls, dbName, sourcePositions[shardIndex], uint32(qr.InsertID))
 				}
 				if err := scw.wr.SourceShardAdd(ctx, keyspace, shard, uint32(qr.InsertID), src.Keyspace(), src.ShardName(), src.Shard.KeyRange, nil); err != nil {
 					processError("could not add source shard: %v", err)

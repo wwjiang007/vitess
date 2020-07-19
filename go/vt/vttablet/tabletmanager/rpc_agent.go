@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,9 +31,9 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// RPCAgent defines the interface implemented by the Agent for RPCs.
+// RPCTM defines the interface implemented by the TM for RPCs.
 // It is useful for RPC implementations to test their full stack.
-type RPCAgent interface {
+type RPCTM interface {
 	// RPC calls
 
 	// Various read-only methods
@@ -66,6 +66,10 @@ type RPCAgent interface {
 
 	ApplySchema(ctx context.Context, change *tmutils.SchemaChange) (*tabletmanagerdatapb.SchemaChangeResult, error)
 
+	LockTables(ctx context.Context) error
+
+	UnlockTables(ctx context.Context) error
+
 	ExecuteFetchAsDba(ctx context.Context, query []byte, dbName string, maxrows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error)
 
 	ExecuteFetchAsAllPrivs(ctx context.Context, query []byte, dbName string, maxrows int, reloadSchema bool) (*querypb.QueryResult, error)
@@ -74,19 +78,41 @@ type RPCAgent interface {
 
 	// Replication related methods
 
+	//Deprecated
 	SlaveStatus(ctx context.Context) (*replicationdatapb.Status, error)
+
+	MasterStatus(ctx context.Context) (*replicationdatapb.MasterStatus, error)
+
+	//Deprecated
+	StopSlave(ctx context.Context) error
+
+	//Deprecated
+	StopSlaveMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
+
+	//Deprecated
+	StartSlave(ctx context.Context) error
+
+	//Deprecated
+	StartSlaveUntilAfter(ctx context.Context, position string, waitTime time.Duration) error
+
+	//Deprecated
+	GetSlaves(ctx context.Context) ([]string, error)
+
+	ReplicationStatus(ctx context.Context) (*replicationdatapb.Status, error)
+
+	StopReplication(ctx context.Context) error
+
+	StopReplicationMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
+
+	StartReplication(ctx context.Context) error
+
+	StartReplicationUntilAfter(ctx context.Context, position string, waitTime time.Duration) error
+
+	GetReplicas(ctx context.Context) ([]string, error)
 
 	MasterPosition(ctx context.Context) (string, error)
 
-	StopSlave(ctx context.Context) error
-
-	StopSlaveMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
-
-	StartSlave(ctx context.Context) error
-
-	TabletExternallyReparented(ctx context.Context, externalID string) error
-
-	GetSlaves(ctx context.Context) ([]string, error)
+	WaitForPosition(ctx context.Context, pos string) error
 
 	// VReplication API
 	VReplicationExec(ctx context.Context, query string) (*querypb.QueryResult, error)
@@ -100,25 +126,34 @@ type RPCAgent interface {
 
 	PopulateReparentJournal(ctx context.Context, timeCreatedNS int64, actionName string, masterAlias *topodatapb.TabletAlias, pos string) error
 
+	// Deprecated
 	InitSlave(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64) error
 
-	DemoteMaster(ctx context.Context) (string, error)
+	InitReplica(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64) error
 
-	PromoteSlaveWhenCaughtUp(ctx context.Context, replicationPosition string) (string, error)
+	DemoteMaster(ctx context.Context) (*replicationdatapb.MasterStatus, error)
 
+	UndoDemoteMaster(ctx context.Context) error
+
+	// Deprecated
 	SlaveWasPromoted(ctx context.Context) error
 
-	SetMaster(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, forceStartSlave bool) error
+	ReplicaWasPromoted(ctx context.Context) error
 
+	SetMaster(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, waitPosition string, forceStartReplication bool) error
+
+	// Deprecated
 	SlaveWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
 
-	StopReplicationAndGetStatus(ctx context.Context) (*replicationdatapb.Status, error)
+	StopReplicationAndGetStatus(ctx context.Context, stopReplicationMode replicationdatapb.StopReplicationMode) (StopReplicationAndGetStatusResponse, error)
 
-	PromoteSlave(ctx context.Context) (string, error)
+	ReplicaWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
+
+	PromoteReplica(ctx context.Context) (string, error)
 
 	// Backup / restore related methods
 
-	Backup(ctx context.Context, concurrency int, logger logutil.Logger) error
+	Backup(ctx context.Context, concurrency int, logger logutil.Logger, allowMaster bool) error
 
 	RestoreFromBackup(ctx context.Context, logger logutil.Logger) error
 

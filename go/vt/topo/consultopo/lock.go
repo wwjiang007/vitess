@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,11 +17,12 @@ limitations under the License.
 package consultopo
 
 import (
-	"fmt"
 	"path"
 
 	"github.com/hashicorp/consul/api"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/topo"
@@ -106,7 +107,7 @@ func (s *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockD
 func (ld *consulLockDescriptor) Check(ctx context.Context) error {
 	select {
 	case <-ld.lost:
-		return fmt.Errorf("lost channel closed")
+		return vterrors.Errorf(vtrpc.Code_INTERNAL, "lost channel closed")
 	default:
 	}
 	return nil
@@ -123,7 +124,7 @@ func (s *Server) unlock(ctx context.Context, lockPath string) error {
 	li, ok := s.locks[lockPath]
 	s.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("unlock: lock %v not held", lockPath)
+		return vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "unlock: lock %v not held", lockPath)
 	}
 
 	// Try to unlock our lock. We will clean up our entry anyway.
@@ -135,7 +136,7 @@ func (s *Server) unlock(ctx context.Context, lockPath string) error {
 	close(li.done)
 
 	// Then try to remove the lock entirely. This will only work if
-	// noone else has the lock.
+	// no one else has the lock.
 	if err := li.lock.Destroy(); err != nil {
 		// If someone else has the lock, we can't remove it,
 		// but we don't need to.

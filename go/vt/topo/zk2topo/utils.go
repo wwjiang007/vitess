@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -23,9 +23,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/samuel/go-zookeeper/zk"
+	"github.com/z-division/go-zookeeper/zk"
 	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/fileutil"
 )
@@ -273,7 +274,7 @@ func DeleteRecursive(ctx context.Context, zconn *ZkConn, zkPath string, version 
 	for _, child := range children {
 		err := DeleteRecursive(ctx, zconn, path.Join(zkPath, child), -1)
 		if err != nil && err != zk.ErrNoNode {
-			return fmt.Errorf("DeleteRecursive: recursive delete failed: %v", err)
+			return vterrors.Wrapf(err, "DeleteRecursive: recursive delete failed")
 		}
 	}
 
@@ -297,7 +298,7 @@ func obtainQueueLock(ctx context.Context, conn *ZkConn, zkPath string) error {
 		// Get our siblings.
 		children, _, err := conn.Children(ctx, queueNode)
 		if err != nil {
-			return fmt.Errorf("obtainQueueLock: trylock failed %v", err)
+			return vterrors.Wrap(err, "obtainQueueLock: trylock failed %v")
 		}
 		sort.Strings(children)
 		if len(children) == 0 {
@@ -325,7 +326,7 @@ func obtainQueueLock(ctx context.Context, conn *ZkConn, zkPath string) error {
 		zkPrevLock := path.Join(queueNode, prevLock)
 		exists, _, watch, err := conn.ExistsW(ctx, zkPrevLock)
 		if err != nil {
-			return fmt.Errorf("obtainQueueLock: unable to watch queued node %v %v", zkPrevLock, err)
+			return vterrors.Wrapf(err, "obtainQueueLock: unable to watch queued node %v", zkPrevLock)
 		}
 		if !exists {
 			// The lock disappeared, try to read again.

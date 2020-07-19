@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -19,6 +19,9 @@ package worker
 import (
 	"fmt"
 
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"golang.org/x/net/context"
@@ -97,15 +100,15 @@ func generateChunks(ctx context.Context, wr *wrangler.Wrangler, tablet *topodata
 	qr, err := wr.TabletManagerClient().ExecuteFetchAsApp(shortCtx, tablet, true, []byte(query), 1)
 	cancel()
 	if err != nil {
-		return nil, vterrors.Wrapf(err, "tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. ExecuteFetchAsApp: %v", topoproto.TabletAliasString(tablet.Alias), td.Name)
+		return nil, vterrors.Wrapf(err, "tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. ExecuteFetchAsApp", topoproto.TabletAliasString(tablet.Alias), td.Name)
 	}
 	if len(qr.Rows) != 1 {
-		return nil, fmt.Errorf("tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. Zero rows were returned", topoproto.TabletAliasString(tablet.Alias), td.Name)
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "tablet: %v, table: %v: cannot determine MIN and MAX of the first primary key column. Zero rows were returned", topoproto.TabletAliasString(tablet.Alias), td.Name)
 	}
 
 	result := sqltypes.Proto3ToResult(qr)
-	min, _ := sqltypes.ToNative(result.Rows[0][0])
-	max, _ := sqltypes.ToNative(result.Rows[0][1])
+	min, _ := evalengine.ToNative(result.Rows[0][0])
+	max, _ := evalengine.ToNative(result.Rows[0][1])
 
 	if min == nil || max == nil {
 		wr.Logger().Infof("table=%v: Not splitting the table into multiple chunks, min or max is NULL: %v", td.Name, qr.Rows[0])

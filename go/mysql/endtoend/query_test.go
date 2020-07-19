@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -236,4 +236,53 @@ func readRowsUsingStream(t *testing.T, conn *mysql.Conn, expectedCount int) {
 		t.Errorf("Got unexpected count %v for query, was expecting %v", count, expectedCount)
 	}
 	conn.CloseResult()
+}
+
+func doTestWarnings(t *testing.T, disableClientDeprecateEOF bool) {
+	ctx := context.Background()
+
+	connParams.DisableClientDeprecateEOF = disableClientDeprecateEOF
+
+	conn, err := mysql.Connect(ctx, &connParams)
+	expectNoError(t, err)
+	defer conn.Close()
+
+	result, err := conn.ExecuteFetch("create table a(id int, val int not null, primary key(id))", 0, false)
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	if result.RowsAffected != 0 {
+		t.Errorf("create table returned RowsAffected %v, was expecting 0", result.RowsAffected)
+	}
+
+	// Disable strict mode
+	_, err = conn.ExecuteFetch("set session sql_mode=''", 0, false)
+	if err != nil {
+		t.Fatalf("disable strict mode failed: %v", err)
+	}
+
+	// Try a simple insert with a null value
+	result, warnings, err := conn.ExecuteFetchWithWarningCount("insert into a(id) values(10)", 1000, true)
+	if err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	if result.RowsAffected != 1 || len(result.Rows) != 0 {
+		t.Errorf("unexpected result for insert: %v", result)
+	}
+	if warnings != 1 {
+		t.Errorf("unexpected result for warnings: %v", warnings)
+	}
+
+	_, err = conn.ExecuteFetch("drop table a", 0, false)
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+}
+
+func TestWarningsDeprecateEOF(t *testing.T) {
+	doTestWarnings(t, false)
+}
+
+func TestWarningsNoDeprecateEOF(t *testing.T) {
+	doTestWarnings(t, true)
 }

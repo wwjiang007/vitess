@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -68,11 +68,11 @@ type VerticalSplitDiffWorker struct {
 // NewVerticalSplitDiffWorker returns a new VerticalSplitDiffWorker object.
 func NewVerticalSplitDiffWorker(wr *wrangler.Wrangler, cell, keyspace, shard string, minHealthyRdonlyTablets, parallelDiffsCount int, destintationTabletType topodatapb.TabletType) Worker {
 	return &VerticalSplitDiffWorker{
-		StatusWorker: NewStatusWorker(),
-		wr:           wr,
-		cell:         cell,
-		keyspace:     keyspace,
-		shard:        shard,
+		StatusWorker:            NewStatusWorker(),
+		wr:                      wr,
+		cell:                    cell,
+		keyspace:                keyspace,
+		shard:                   shard,
 		minHealthyRdonlyTablets: minHealthyRdonlyTablets,
 		destinationTabletType:   destintationTabletType,
 		parallelDiffsCount:      parallelDiffsCount,
@@ -89,6 +89,8 @@ func (vsdw *VerticalSplitDiffWorker) StatusAsHTML() template.HTML {
 	switch state {
 	case WorkerStateDiff:
 		result += "<b>Running</b>:</br>\n"
+	case WorkerStateDiffWillFail:
+		result += "<b>Running - have already found differences...</b></br>\n"
 	case WorkerStateDone:
 		result += "<b>Success</b>:</br>\n"
 	}
@@ -105,6 +107,8 @@ func (vsdw *VerticalSplitDiffWorker) StatusAsText() string {
 	switch state {
 	case WorkerStateDiff:
 		result += "Running...\n"
+	case WorkerStateDiffWillFail:
+		result += "Running - have already found differences...\n"
 	case WorkerStateDone:
 		result += "Success.\n"
 	}
@@ -120,7 +124,7 @@ func (vsdw *VerticalSplitDiffWorker) Run(ctx context.Context) error {
 	cerr := vsdw.cleaner.CleanUp(vsdw.wr)
 	if cerr != nil {
 		if err != nil {
-			vsdw.wr.Logger().Errorf("CleanUp failed in addition to job error: %v", cerr)
+			vsdw.wr.Logger().Errorf2(cerr, "CleanUp failed in addition to job error")
 		} else {
 			err = cerr
 		}
@@ -243,13 +247,13 @@ func (vsdw *VerticalSplitDiffWorker) findTargets(ctx context.Context) error {
 // 2 - stop the source tablet at a binlog position higher than the
 //   destination master. Get that new position.
 //   (add a cleanup task to restart binlog replication on it, and change
-//    the existing ChangeSlaveType cleanup action to 'spare' type)
+//    the existing ChangeTabletType cleanup action to 'spare' type)
 // 3 - ask the master of the destination shard to resume filtered replication
 //   up to the new list of positions, and return its binlog position.
 // 4 - wait until the destination tablet is equal or passed that master
 //   binlog position, and stop its replication.
 //   (add a cleanup task to restart binlog replication on it, and change
-//    the existing ChangeSlaveType cleanup action to 'spare' type)
+//    the existing ChangeTabletType cleanup action to 'spare' type)
 // 5 - restart filtered replication on destination master.
 //   (remove the cleanup task that does the same)
 // At this point, all source and destination tablets are stopped at the same point.
@@ -281,26 +285,26 @@ func (vsdw *VerticalSplitDiffWorker) synchronizeReplication(ctx context.Context)
 	}
 	qr := sqltypes.Proto3ToResult(p3qr)
 	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
-		return fmt.Errorf("Unexpected result while reading position: %v", qr)
+		return fmt.Errorf("unexpected result while reading position: %v", qr)
 	}
 	vreplicationPos := qr.Rows[0][0].ToString()
 
 	// stop replication
-	vsdw.wr.Logger().Infof("Stopping slave %v at a minimum of %v", topoproto.TabletAliasString(vsdw.sourceAlias), vreplicationPos)
+	vsdw.wr.Logger().Infof("Stopping replication %v at a minimum of %v", topoproto.TabletAliasString(vsdw.sourceAlias), vreplicationPos)
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
 	sourceTablet, err := vsdw.wr.TopoServer().GetTablet(shortCtx, vsdw.sourceAlias)
 	if err != nil {
 		return err
 	}
-	mysqlPos, err := vsdw.wr.TabletManagerClient().StopSlaveMinimum(shortCtx, sourceTablet.Tablet, vreplicationPos, *remoteActionsTimeout)
+	mysqlPos, err := vsdw.wr.TabletManagerClient().StopReplicationMinimum(shortCtx, sourceTablet.Tablet, vreplicationPos, *remoteActionsTimeout)
 	if err != nil {
-		return vterrors.Wrapf(err, "cannot stop slave %v at right binlog position %v", topoproto.TabletAliasString(vsdw.sourceAlias), vreplicationPos)
+		return vterrors.Wrapf(err, "cannot stop replica %v at right binlog position %v", topoproto.TabletAliasString(vsdw.sourceAlias), vreplicationPos)
 	}
 
-	// change the cleaner actions from ChangeSlaveType(rdonly)
-	// to StartSlave() + ChangeSlaveType(spare)
-	wrangler.RecordStartSlaveAction(vsdw.cleaner, sourceTablet.Tablet)
+	// change the cleaner actions from ChangeTabletType(rdonly)
+	// to StartReplication() + ChangeTabletType(spare)
+	wrangler.RecordStartReplicationAction(vsdw.cleaner, sourceTablet.Tablet)
 
 	// 3 - ask the master of the destination shard to resume filtered
 	//     replication up to the new list of positions
@@ -330,17 +334,17 @@ func (vsdw *VerticalSplitDiffWorker) synchronizeReplication(ctx context.Context)
 	}
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
-	_, err = vsdw.wr.TabletManagerClient().StopSlaveMinimum(shortCtx, destinationTablet.Tablet, masterPos, *remoteActionsTimeout)
+	_, err = vsdw.wr.TabletManagerClient().StopReplicationMinimum(shortCtx, destinationTablet.Tablet, masterPos, *remoteActionsTimeout)
 	if err != nil {
-		return vterrors.Wrapf(err, "StopSlaveMinimum on %v at %v failed", topoproto.TabletAliasString(vsdw.destinationAlias), masterPos)
+		return vterrors.Wrapf(err, "StopReplicationMinimum on %v at %v failed", topoproto.TabletAliasString(vsdw.destinationAlias), masterPos)
 	}
-	wrangler.RecordStartSlaveAction(vsdw.cleaner, destinationTablet.Tablet)
+	wrangler.RecordStartReplicationAction(vsdw.cleaner, destinationTablet.Tablet)
 
 	// 5 - restart filtered replication on destination master
 	vsdw.wr.Logger().Infof("Restarting filtered replication on master %v", topoproto.TabletAliasString(vsdw.shardInfo.MasterAlias))
 	shortCtx, cancel = context.WithTimeout(ctx, *remoteActionsTimeout)
 	defer cancel()
-	if _, err = vsdw.wr.TabletManagerClient().VReplicationExec(ctx, masterInfo.Tablet, binlogplayer.StartVReplication(ss.Uid)); err != nil {
+	if _, err = vsdw.wr.TabletManagerClient().VReplicationExec(shortCtx, masterInfo.Tablet, binlogplayer.StartVReplication(ss.Uid)); err != nil {
 		return vterrors.Wrapf(err, "VReplicationExec(start) failed for %v", vsdw.shardInfo.MasterAlias)
 	}
 
@@ -365,7 +369,9 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 		vsdw.destinationSchemaDefinition, err = vsdw.wr.GetSchema(
 			shortCtx, vsdw.destinationAlias, vsdw.shardInfo.SourceShards[0].Tables, nil /* excludeTables */, false /* includeViews */)
 		cancel()
-		rec.RecordError(err)
+		if err != nil {
+			vsdw.markAsWillFail(rec, err)
+		}
 		vsdw.wr.Logger().Infof("Got schema from destination %v", topoproto.TabletAliasString(vsdw.destinationAlias))
 		wg.Done()
 	}()
@@ -376,7 +382,9 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 		vsdw.sourceSchemaDefinition, err = vsdw.wr.GetSchema(
 			shortCtx, vsdw.sourceAlias, vsdw.shardInfo.SourceShards[0].Tables, nil /* excludeTables */, false /* includeViews */)
 		cancel()
-		rec.RecordError(err)
+		if err != nil {
+			vsdw.markAsWillFail(rec, err)
+		}
 		vsdw.wr.Logger().Infof("Got schema from source %v", topoproto.TabletAliasString(vsdw.sourceAlias))
 		wg.Done()
 	}()
@@ -409,8 +417,8 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 			sourceQueryResultReader, err := TableScan(ctx, vsdw.wr.Logger(), vsdw.wr.TopoServer(), vsdw.sourceAlias, tableDefinition)
 			if err != nil {
 				newErr := vterrors.Wrap(err, "TableScan(source) failed")
-				rec.RecordError(newErr)
-				vsdw.wr.Logger().Errorf("%v", newErr)
+				vsdw.markAsWillFail(rec, newErr)
+				vsdw.wr.Logger().Error(newErr)
 				return
 			}
 			defer sourceQueryResultReader.Close(ctx)
@@ -418,8 +426,8 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 			destinationQueryResultReader, err := TableScan(ctx, vsdw.wr.Logger(), vsdw.wr.TopoServer(), vsdw.destinationAlias, tableDefinition)
 			if err != nil {
 				newErr := vterrors.Wrap(err, "TableScan(destination) failed")
-				rec.RecordError(newErr)
-				vsdw.wr.Logger().Errorf("%v", newErr)
+				vsdw.markAsWillFail(rec, newErr)
+				vsdw.wr.Logger().Error(newErr)
 				return
 			}
 			defer destinationQueryResultReader.Close(ctx)
@@ -427,19 +435,19 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 			differ, err := NewRowDiffer(sourceQueryResultReader, destinationQueryResultReader, tableDefinition)
 			if err != nil {
 				newErr := vterrors.Wrap(err, "NewRowDiffer() failed")
-				rec.RecordError(newErr)
-				vsdw.wr.Logger().Errorf("%v", newErr)
+				vsdw.markAsWillFail(rec, newErr)
+				vsdw.wr.Logger().Error(newErr)
 				return
 			}
 
 			report, err := differ.Go(vsdw.wr.Logger())
 			if err != nil {
-				vsdw.wr.Logger().Errorf("Differ.Go failed: %v", err)
+				vsdw.wr.Logger().Errorf2(err, "Differ.Go failed")
 			} else {
 				if report.HasDifferences() {
-					err := fmt.Errorf("Table %v has differences: %v", tableDefinition.Name, report.String())
-					rec.RecordError(err)
-					vsdw.wr.Logger().Errorf("%v", err)
+					err := fmt.Errorf("table %v has differences: %v", tableDefinition.Name, report.String())
+					vsdw.markAsWillFail(rec, err)
+					vsdw.wr.Logger().Error(err)
 				} else {
 					vsdw.wr.Logger().Infof("Table %v checks out (%v rows processed, %v qps)", tableDefinition.Name, report.processedRows, report.processingQPS)
 				}
@@ -449,4 +457,10 @@ func (vsdw *VerticalSplitDiffWorker) diff(ctx context.Context) error {
 	wg.Wait()
 
 	return rec.Error()
+}
+
+// markAsWillFail records the error and changes the state of the worker to reflect this
+func (vsdw *VerticalSplitDiffWorker) markAsWillFail(er concurrency.ErrorRecorder, err error) {
+	er.RecordError(err)
+	vsdw.SetState(WorkerStateDiffWillFail)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
@@ -124,7 +125,7 @@ func (ra *RowAggregator) Flush() error {
 	select {
 	case ra.insertChannel <- ra.buffer.String():
 	case <-ra.ctx.Done():
-		return fmt.Errorf("failed to flush RowAggregator and send the query to a writer thread channel: %v", ra.ctx.Err())
+		return vterrors.Wrap(ra.ctx.Err(), "failed to flush RowAggregator and send the query to a writer thread channel")
 	}
 
 	// Update our statistics.

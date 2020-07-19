@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,12 +18,13 @@ package heartbeat
 
 import (
 	"fmt"
-	"math/rand"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	"gotest.tools/assert"
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
-	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -37,10 +38,6 @@ var (
 	}
 )
 
-// TestCreateSchema tests that our initial INSERT uses
-// the proper arguments. It also sanity checks the other init
-// queries for completeness, and verifies that we return any
-// failure that is encountered.
 func TestCreateSchema(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
@@ -48,45 +45,39 @@ func TestCreateSchema(t *testing.T) {
 	defer tw.Close()
 	writes.Reset()
 
-	db.AddQuery(sqlTurnoffBinlog, &sqltypes.Result{})
-	db.AddQuery(fmt.Sprintf(sqlCreateHeartbeatTable, tw.dbName), &sqltypes.Result{})
-	db.AddQuery(fmt.Sprintf("INSERT INTO %s.heartbeat (ts, tabletUid, keyspaceShard) VALUES (%d, %d, '%s') ON DUPLICATE KEY UPDATE ts=VALUES(ts)", tw.dbName, now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard), &sqltypes.Result{})
-	if err := tw.initializeTables(db.ConnParams()); err == nil {
-		t.Fatal("initializeTables() should not have succeeded")
+	db.OrderMatters()
+	upsert := fmt.Sprintf("INSERT INTO %s.heartbeat (ts, tabletUid, keyspaceShard) VALUES (%d, %d, '%s') ON DUPLICATE KEY UPDATE ts=VALUES(ts), tabletUid=VALUES(tabletUid)",
+		"_vt", now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard)
+	failInsert := fakesqldb.ExpectedExecuteFetch{
+		Query: upsert,
+		Error: mysql.NewSQLError(mysql.ERBadDb, "", "bad db error"),
 	}
+	db.AddExpectedExecuteFetch(failInsert)
+	db.AddExpectedQuery(fmt.Sprintf(sqlCreateSidecarDB, "_vt"), nil)
+	db.AddExpectedQuery(fmt.Sprintf(sqlCreateHeartbeatTable, "_vt"), nil)
+	db.AddExpectedQuery(upsert, nil)
 
-	db.AddQuery(fmt.Sprintf(sqlCreateSidecarDB, tw.dbName), &sqltypes.Result{})
-	if err := tw.initializeTables(db.ConnParams()); err != nil {
-		t.Fatalf("Should not be in error: %v", err)
-	}
-
-	if got, want := writes.Get(), int64(1); got != want {
-		t.Fatalf("wrong writes count: got = %v, want = %v", got, want)
-	}
+	err := tw.write()
+	require.NoError(t, err)
 }
 
-// TestWriteHearbeat ensures the proper arguments for the UPDATE query
-// and writes get recorded in counters.
 func TestWriteHeartbeat(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
 
 	tw := newTestWriter(db, mockNowFunc)
-	db.AddQuery(fmt.Sprintf("UPDATE %s.heartbeat SET ts=%d, tabletUid=%d WHERE keyspaceShard='%s'", tw.dbName, now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard), &sqltypes.Result{})
+	upsert := fmt.Sprintf("INSERT INTO %s.heartbeat (ts, tabletUid, keyspaceShard) VALUES (%d, %d, '%s') ON DUPLICATE KEY UPDATE ts=VALUES(ts), tabletUid=VALUES(tabletUid)",
+		"_vt", now.UnixNano(), tw.tabletAlias.Uid, tw.keyspaceShard)
+	db.AddQuery(upsert, &sqltypes.Result{})
 
 	writes.Reset()
 	writeErrors.Reset()
 
 	tw.writeHeartbeat()
-	if got, want := writes.Get(), int64(1); got != want {
-		t.Fatalf("wrong writes count: got = %v; want = %v", got, want)
-	}
-	if got, want := writeErrors.Get(), int64(0); got != want {
-		t.Fatalf("wrong write errors count: got = %v; want = %v", got, want)
-	}
+	assert.Equal(t, int64(1), writes.Get())
+	assert.Equal(t, int64(0), writeErrors.Get())
 }
 
-// TestWriteHeartbeatError ensures that we properly account for write errors.
 func TestWriteHeartbeatError(t *testing.T) {
 	db := fakesqldb.New(t)
 	defer db.Close()
@@ -97,33 +88,22 @@ func TestWriteHeartbeatError(t *testing.T) {
 	writeErrors.Reset()
 
 	tw.writeHeartbeat()
-	if got, want := writes.Get(), int64(0); got != want {
-		t.Fatalf("wrong writes count: got = %v; want = %v", got, want)
-	}
-	if got, want := writeErrors.Get(), int64(1); got != want {
-		t.Fatalf("wrong write errors count: got = %v; want = %v", got, want)
-	}
+	assert.Equal(t, int64(0), writes.Get())
+	assert.Equal(t, int64(1), writeErrors.Get())
 }
 
 func newTestWriter(db *fakesqldb.DB, nowFunc func() time.Time) *Writer {
-	randID := rand.Int63()
-	config := tabletenv.DefaultQsConfig
-	config.HeartbeatEnable = true
-	config.PoolNamePrefix = fmt.Sprintf("Pool-%d-", randID)
+	config := tabletenv.NewDefaultConfig()
+	config.HeartbeatIntervalSeconds = 1
 
-	dbc := dbconfigs.NewTestDBConfigs(*db.ConnParams(), *db.ConnParams(), "")
+	params, _ := db.ConnParams().MysqlParams()
+	cp := *params
+	dbc := dbconfigs.NewTestDBConfigs(cp, cp, "")
 
-	tw := NewWriter(&fakeMysqlChecker{},
-		topodatapb.TabletAlias{Cell: "test", Uid: 1111},
-		config)
-	tw.dbName = sqlescape.EscapeID(dbc.SidecarDBName.Get())
+	tw := NewWriter(tabletenv.NewEnv(config, "WriterTest"), topodatapb.TabletAlias{Cell: "test", Uid: 1111})
 	tw.keyspaceShard = "test:0"
 	tw.now = nowFunc
 	tw.pool.Open(dbc.AppWithDB(), dbc.DbaWithDB(), dbc.AppDebugWithDB())
 
 	return tw
 }
-
-type fakeMysqlChecker struct{}
-
-func (f fakeMysqlChecker) CheckMySQL() {}

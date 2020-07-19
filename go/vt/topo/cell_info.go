@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -17,13 +17,14 @@ limitations under the License.
 package topo
 
 import (
-	"fmt"
 	"path"
 
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 // This file provides the utility methods to save / retrieve CellInfo
@@ -134,25 +135,20 @@ func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update 
 }
 
 // DeleteCellInfo deletes the specified CellInfo.
-// We first make sure no Shard record points to the cell.
-func (ts *Server) DeleteCellInfo(ctx context.Context, cell string) error {
-	// Get all keyspaces.
-	keyspaces, err := ts.GetKeyspaces(ctx)
-	if err != nil {
-		return fmt.Errorf("GetKeyspaces() failed: %v", err)
-	}
-
-	// For each keyspace, make sure no shard points at the cell.
-	for _, keyspace := range keyspaces {
-		shards, err := ts.FindAllShardsInKeyspace(ctx, keyspace)
-		if err != nil {
-			return fmt.Errorf("FindAllShardsInKeyspace(%v) failed: %v", keyspace, err)
+// We first try to make sure no Shard record points to the cell,
+// but we'll continue regardless if 'force' is true.
+func (ts *Server) DeleteCellInfo(ctx context.Context, cell string, force bool) error {
+	srvKeyspaces, err := ts.GetSrvKeyspaceNames(ctx, cell)
+	switch {
+	case err == nil:
+		if len(srvKeyspaces) != 0 && !force {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cell %v has serving keyspaces. Before deleting, delete keyspace with DeleteKeyspace, or use -force to continue anyway.", cell)
 		}
-
-		for shard, si := range shards {
-			if si.HasCell(cell) {
-				return fmt.Errorf("cell %v is used by shard %v/%v, cannot remove it. Use 'vtctl RemoveShardCell' to remove unused cells in a Shard", cell, keyspace, shard)
-			}
+	case IsErrType(err, NoNode):
+		// Nothing to do.
+	default:
+		if !force {
+			return vterrors.Wrap(err, "can't list SrvKeyspace entries in the cell; use -force flag to continue anyway (e.g. if cell-local topo was already permanently shut down)")
 		}
 	}
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Google Inc.
+Copyright 2019 The Vitess Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -21,6 +21,8 @@ import (
 	"path"
 
 	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -42,7 +44,7 @@ func (c *Conn) Create(ctx context.Context, filePath string, contents []byte) (to
 	dir, file := path.Split(filePath)
 	p := c.factory.getOrCreatePath(c.cell, dir)
 	if p == nil {
-		return nil, fmt.Errorf("trying to create file %v in cell %v in a path that contains files", filePath, c.cell)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "trying to create file %v in cell %v in a path that contains files", filePath, c.cell)
 	}
 
 	// Check the file doesn't already exist.
@@ -79,7 +81,7 @@ func (c *Conn) Update(ctx context.Context, filePath string, contents []byte, ver
 		}
 		p = c.factory.getOrCreatePath(c.cell, dir)
 		if p == nil {
-			return nil, fmt.Errorf("trying to create file %v in cell %v in a path that contains files", filePath, c.cell)
+			return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "trying to create file %v in cell %v in a path that contains files", filePath, c.cell)
 		}
 	}
 
@@ -97,7 +99,7 @@ func (c *Conn) Update(ctx context.Context, filePath string, contents []byte, ver
 
 	// Check if it's a directory.
 	if n.isDirectory() {
-		return nil, fmt.Errorf("Update(%v, %v) failed: it's a directory", c.cell, filePath)
+		return nil, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "Update(%v, %v) failed: it's a directory", c.cell, filePath)
 	}
 
 	// Check the version.
@@ -165,7 +167,8 @@ func (c *Conn) Delete(ctx context.Context, filePath string, version topo.Version
 
 	// Check if it's a directory.
 	if n.isDirectory() {
-		return fmt.Errorf("Delete(%v, %v) failed: it's a directory", c.cell, filePath)
+		//lint:ignore ST1005 Delete is a function name
+		return fmt.Errorf("delete(%v, %v) failed: it's a directory", c.cell, filePath)
 	}
 
 	// Check the version.
