@@ -79,45 +79,19 @@ type Getter interface {
 // Use Connect on the client side to create a connection.
 // Use NewListener to create a server side and listen for connections.
 type Conn struct {
-	// conn is the underlying network connection.
-	// Calling Close() on the Conn will close this connection.
-	// If there are any ongoing reads or writes, they may get interrupted.
-	conn net.Conn
+	// fields contains the fields definitions for an on-going
+	// streaming query. It is set by ExecuteStreamFetch, and
+	// cleared by the last FetchNext().  It is nil if no streaming
+	// query is in progress.  If the streaming query returned no
+	// fields, this is set to an empty array (but not nil).
+	fields []*querypb.Field
 
-	// For server-side connections, listener points to the server object.
-	listener *Listener
+	// salt is sent by the server during initial handshake to be used for authentication
+	salt []byte
 
-	// ConnectionID is set:
-	// - at Connect() time for clients, with the value returned by
-	// the server.
-	// - at accept time for the server.
-	ConnectionID uint32
-
-	// closed is set to true when Close() is called on the connection.
-	closed sync2.AtomicBool
-
-	// Capabilities is the current set of features this connection
-	// is using.  It is the features that are both supported by
-	// the client and the server, and currently in use.
+	// authPluginName is the name of server's authentication plugin.
 	// It is set during the initial handshake.
-	//
-	// It is only used for CapabilityClientDeprecateEOF
-	// and CapabilityClientFoundRows.
-	Capabilities uint32
-
-	// CharacterSet is the character set used by the other side of the
-	// connection.
-	// It is set during the initial handshake.
-	// See the values in constants.go.
-	CharacterSet uint8
-
-	// User is the name used by the client to connect.
-	// It is set during the initial handshake.
-	User string
-
-	// UserData is custom data returned by the AuthServer module.
-	// It is set during the initial handshake.
-	UserData Getter
+	authPluginName string
 
 	// schemaName is the default database name to use. It is set
 	// during handshake, and by ComInitDb packets. Both client and
@@ -126,42 +100,36 @@ type Conn struct {
 	// through the 'USE' statement, which will bypass this variable.
 	schemaName string
 
-	// ServerVersion is set during Connect with the server
-	// version.  It is not changed afterwards. It is unused for
-	// server-side connections.
-	ServerVersion string
-
-	// flavor contains the auto-detected flavor for this client
-	// connection. It is unused for server-side connections.
-	flavor flavor
-
-	// StatusFlags are the status flags we will base our returned flags on.
-	// This is a bit field, with values documented in constants.go.
-	// An interesting value here would be ServerStatusAutocommit.
-	// It is only used by the server. These flags can be changed
-	// by Handler methods.
-	StatusFlags uint16
-
 	// ClientData is a place where an application can store any
 	// connection-related data. Mostly used on the server side, to
 	// avoid maps indexed by ConnectionID for instance.
 	ClientData interface{}
 
-	// Packet encoding variables.
-	sequence       uint8
+	// conn is the underlying network connection.
+	// Calling Close() on the Conn will close this connection.
+	// If there are any ongoing reads or writes, they may get interrupted.
+	conn net.Conn
+
+	// flavor contains the auto-detected flavor for this client
+	// connection. It is unused for server-side connections.
+	flavor flavor
+
+	// ServerVersion is set during Connect with the server
+	// version.  It is not changed afterwards. It is unused for
+	// server-side connections.
+	ServerVersion string
+
+	// User is the name used by the client to connect.
+	// It is set during the initial handshake.
+	User string // For server-side connections, listener points to the server object.
+
+	// UserData is custom data returned by the AuthServer module.
+	// It is set during the initial handshake.
+	UserData Getter
+
 	bufferedReader *bufio.Reader
-
-	// Buffered writing has a timer which flushes on inactivity.
-	bufMu          sync.Mutex
-	bufferedWriter *bufio.Writer
 	flushTimer     *time.Timer
-
-	// fields contains the fields definitions for an on-going
-	// streaming query. It is set by ExecuteStreamFetch, and
-	// cleared by the last FetchNext().  It is nil if no streaming
-	// query is in progress.  If the streaming query returned no
-	// fields, this is set to an empty array (but not nil).
-	fields []*querypb.Field
+	header         [packetHeaderSize]byte
 
 	// Keep track of how and of the buffer we allocated for an
 	// ephemeral packet on the read and write sides.
@@ -173,11 +141,53 @@ type Conn struct {
 	// It can be allocated from bufPool or heap and should be recycled in the same manner.
 	currentEphemeralBuffer *[]byte
 
-	// StatementID is the prepared statement ID.
-	StatementID uint32
+	listener *Listener
+
+	// Buffered writing has a timer which flushes on inactivity.
+	bufferedWriter *bufio.Writer
 
 	// PrepareData is the map to use a prepared statement.
 	PrepareData map[uint32]*PrepareData
+
+	// protects the bufferedWriter and bufferedReader
+	bufMu sync.Mutex
+
+	// Capabilities is the current set of features this connection
+	// is using.  It is the features that are both supported by
+	// the client and the server, and currently in use.
+	// It is set during the initial handshake.
+	//
+	// It is only used for CapabilityClientDeprecateEOF
+	// and CapabilityClientFoundRows.
+	Capabilities uint32
+
+	// closed is set to true when Close() is called on the connection.
+	closed sync2.AtomicBool
+
+	// ConnectionID is set:
+	// - at Connect() time for clients, with the value returned by
+	// the server.
+	// - at accept time for the server.
+	ConnectionID uint32
+
+	// StatementID is the prepared statement ID.
+	StatementID uint32
+
+	// StatusFlags are the status flags we will base our returned flags on.
+	// This is a bit field, with values documented in constants.go.
+	// An interesting value here would be ServerStatusAutocommit.
+	// It is only used by the server. These flags can be changed
+	// by Handler methods.
+	StatusFlags uint16
+
+	// CharacterSet is the character set used by the other side of the
+	// connection.
+	// It is set during the initial handshake.
+	// See the values in constants.go.
+	CharacterSet uint8
+
+	// Packet encoding variables.
+	sequence uint8
 }
 
 // splitStatementFunciton is the function that is used to split the statement in cas ef a multi-statement query.
@@ -185,12 +195,12 @@ var splitStatementFunction func(blob string) (pieces []string, err error) = sqlp
 
 // PrepareData is a buffer used for store prepare statement meta data
 type PrepareData struct {
-	StatementID uint32
-	PrepareStmt string
-	ParamsCount uint16
 	ParamsType  []int32
 	ColumnNames []string
+	PrepareStmt string
 	BindVars    map[string]*querypb.BindVariable
+	StatementID uint32
+	ParamsCount uint16
 }
 
 // execResult is an enum signifying the result of executing a query
@@ -315,14 +325,13 @@ func (c *Conn) getReader() io.Reader {
 }
 
 func (c *Conn) readHeaderFrom(r io.Reader) (int, error) {
-	var header [packetHeaderSize]byte
 	// Note io.ReadFull will return two different types of errors:
 	// 1. if the socket is already closed, and the go runtime knows it,
 	//   then ReadFull will return an error (different than EOF),
 	//   something like 'read: connection reset by peer'.
 	// 2. if the socket is not closed while we start the read,
 	//   but gets closed after the read is started, we'll get io.EOF.
-	if _, err := io.ReadFull(r, header[:]); err != nil {
+	if _, err := io.ReadFull(r, c.header[:]); err != nil {
 		// The special casing of propagating io.EOF up
 		// is used by the server side only, to suppress an error
 		// message if a client just disconnects.
@@ -335,14 +344,14 @@ func (c *Conn) readHeaderFrom(r io.Reader) (int, error) {
 		return 0, vterrors.Wrapf(err, "io.ReadFull(header size) failed")
 	}
 
-	sequence := uint8(header[3])
+	sequence := uint8(c.header[3])
 	if sequence != c.sequence {
 		return 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid sequence, expected %v got %v", c.sequence, sequence)
 	}
 
 	c.sequence++
 
-	return int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16), nil
+	return int(uint32(c.header[0]) | uint32(c.header[1])<<8 | uint32(c.header[2])<<16), nil
 }
 
 // readEphemeralPacket attempts to read a packet into buffer from sync.Pool.  Do
@@ -888,7 +897,7 @@ func (c *Conn) handleNextCommand(handler Handler) bool {
 	default:
 		log.Errorf("Got unhandled packet (default) from %s, returning error: %v", c, data)
 		c.recycleReadPacket()
-		if !c.writeErrorAndLog(ERUnknownComError, SSUnknownComError, "command handling not implemented yet: %v", data[0]) {
+		if !c.writeErrorAndLog(ERUnknownComError, SSNetError, "command handling not implemented yet: %v", data[0]) {
 			return false
 		}
 	}
@@ -913,7 +922,7 @@ func (c *Conn) handleComStmtReset(data []byte) bool {
 	c.recycleReadPacket()
 	if !ok {
 		log.Error("Got unhandled packet from client %v, returning error: %v", c.ConnectionID, data)
-		if !c.writeErrorAndLog(ERUnknownComError, SSUnknownComError, "error handling packet: %v", data) {
+		if !c.writeErrorAndLog(ERUnknownComError, SSNetError, "error handling packet: %v", data) {
 			return false
 		}
 	}
@@ -921,7 +930,7 @@ func (c *Conn) handleComStmtReset(data []byte) bool {
 	prepare, ok := c.PrepareData[stmtID]
 	if !ok {
 		log.Error("Commands were executed in an improper order from client %v, packet: %v", c.ConnectionID, data)
-		if !c.writeErrorAndLog(CRCommandsOutOfSync, SSUnknownComError, "commands were executed in an improper order: %v", data) {
+		if !c.writeErrorAndLog(CRCommandsOutOfSync, SSNetError, "commands were executed in an improper order: %v", data) {
 			return false
 		}
 	}
@@ -1062,7 +1071,15 @@ func (c *Conn) handleComStmtExecute(handler Handler, data []byte) (kontinue bool
 	return true
 }
 
-func (c *Conn) handleComPrepare(handler Handler, data []byte) bool {
+func (c *Conn) handleComPrepare(handler Handler, data []byte) (kontinue bool) {
+	c.startWriterBuffering()
+	defer func() {
+		if err := c.endWriterBuffering(); err != nil {
+			log.Errorf("conn %v: flush() failed: %v", c.ID(), err)
+			kontinue = false
+		}
+	}()
+
 	query := c.parseComPrepare(data)
 	c.recycleReadPacket()
 
@@ -1101,7 +1118,7 @@ func (c *Conn) handleComPrepare(handler Handler, data []byte) bool {
 	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
 		switch node := node.(type) {
 		case sqlparser.Argument:
-			if strings.HasPrefix(string(node), ":v") {
+			if strings.HasPrefix(string(node), "v") {
 				paramsCount++
 			}
 		}
@@ -1146,7 +1163,7 @@ func (c *Conn) handleComSetOption(data []byte) bool {
 			c.Capabilities &^= CapabilityClientMultiStatements
 		default:
 			log.Errorf("Got unhandled packet (ComSetOption default) from client %v, returning error: %v", c.ConnectionID, data)
-			if !c.writeErrorAndLog(ERUnknownComError, SSUnknownComError, "error handling packet: %v", data) {
+			if !c.writeErrorAndLog(ERUnknownComError, SSNetError, "error handling packet: %v", data) {
 				return false
 			}
 		}
@@ -1156,7 +1173,7 @@ func (c *Conn) handleComSetOption(data []byte) bool {
 		}
 	} else {
 		log.Errorf("Got unhandled packet (ComSetOption else) from client %v, returning error: %v", c.ConnectionID, data)
-		if !c.writeErrorAndLog(ERUnknownComError, SSUnknownComError, "error handling packet: %v", data) {
+		if !c.writeErrorAndLog(ERUnknownComError, SSNetError, "error handling packet: %v", data) {
 			return false
 		}
 	}
@@ -1167,7 +1184,7 @@ func (c *Conn) handleComPing() bool {
 	c.recycleReadPacket()
 	// Return error if listener was shut down and OK otherwise
 	if c.listener.isShutdown() {
-		if !c.writeErrorAndLog(ERServerShutdown, SSServerShutdown, "Server shutdown in progress") {
+		if !c.writeErrorAndLog(ERServerShutdown, SSNetError, "Server shutdown in progress") {
 			return false
 		}
 	} else {
@@ -1178,6 +1195,8 @@ func (c *Conn) handleComPing() bool {
 	}
 	return true
 }
+
+var errEmptyStatement = NewSQLError(EREmptyQuery, SSClientError, "Query was empty")
 
 func (c *Conn) handleComQuery(handler Handler, data []byte) (kontinue bool) {
 	c.startWriterBuffering()
@@ -1205,8 +1224,7 @@ func (c *Conn) handleComQuery(handler Handler, data []byte) (kontinue bool) {
 	}
 
 	if len(queries) == 0 {
-		err := NewSQLError(EREmptyQuery, SSSyntaxErrorOrAccessViolation, "Query was empty")
-		return c.writeErrorPacketFromErrorAndLog(err)
+		return c.writeErrorPacketFromErrorAndLog(errEmptyStatement)
 	}
 
 	for index, sql := range queries {
@@ -1329,16 +1347,16 @@ func isEOFPacket(data []byte) bool {
 //
 // Note: This is only valid on actual EOF packets and not on OK packets with the EOF
 // type code set, i.e. should not be used if ClientDeprecateEOF is set.
-func parseEOFPacket(data []byte) (warnings uint16, more bool, err error) {
+func parseEOFPacket(data []byte) (warnings uint16, statusFlags uint16, err error) {
 	// The warning count is in position 2 & 3
 	warnings, _, _ = readUint16(data, 1)
 
 	// The status flag is in position 4 & 5
 	statusFlags, _, ok := readUint16(data, 3)
 	if !ok {
-		return 0, false, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid EOF packet statusFlags: %v", data)
+		return 0, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "invalid EOF packet statusFlags: %v", data)
 	}
-	return warnings, (statusFlags & ServerMoreResultsExists) != 0, nil
+	return warnings, statusFlags, nil
 }
 
 // PacketOK contains the ok packet details

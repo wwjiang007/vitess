@@ -18,12 +18,18 @@ package tabletmanager
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/vt/key"
+	"vitess.io/vitess/go/vt/servenv"
+
+	"context"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/vt/mysqlctl/fakemysqldaemon"
 	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -149,6 +155,158 @@ func TestStateTabletControls(t *testing.T) {
 	assert.False(t, qsc.IsServing())
 }
 
+func TestStateIsShardServingisInSrvKeyspace(t *testing.T) {
+	ctx := context.Background()
+	ts := memorytopo.NewServer("cell1")
+	tm := newTestTM(t, ts, 1, "ks", "0")
+	defer tm.Stop()
+
+	tm.tmState.mu.Lock()
+	tm.tmState.tablet.Type = topodatapb.TabletType_MASTER
+	tm.tmState.mu.Unlock()
+
+	leftKeyRange, err := key.ParseShardingSpec("-80")
+	if err != nil || len(leftKeyRange) != 1 {
+		t.Fatalf("ParseShardingSpec failed. Expected non error and only one element. Got err: %v, len(%v)", err, len(leftKeyRange))
+	}
+
+	rightKeyRange, err := key.ParseShardingSpec("80-")
+	if err != nil || len(rightKeyRange) != 1 {
+		t.Fatalf("ParseShardingSpec failed. Expected non error and only one element. Got err: %v, len(%v)", err, len(rightKeyRange))
+	}
+
+	keyRange, err := key.ParseShardingSpec("0")
+	if err != nil || len(keyRange) != 1 {
+		t.Fatalf("ParseShardingSpec failed. Expected non error and only one element. Got err: %v, len(%v)", err, len(keyRange))
+	}
+
+	// Shard not in the SrvKeyspace, ServedType not in SrvKeyspace
+	ks := &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_DRAINED,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "-80",
+						KeyRange: leftKeyRange[0],
+					},
+					{
+						Name:     "80-",
+						KeyRange: rightKeyRange[0],
+					},
+				},
+			},
+		},
+	}
+	want := map[topodatapb.TabletType]bool{}
+	tm.tmState.RefreshFromTopoInfo(ctx, nil, ks)
+
+	tm.tmState.mu.Lock()
+	assert.False(t, tm.tmState.isInSrvKeyspace)
+	assert.Equal(t, want, tm.tmState.isShardServing)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(0), statsIsInSrvKeyspace.Get())
+
+	// Shard not in the SrvKeyspace, ServedType in SrvKeyspace
+	ks = &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_MASTER,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "-80",
+						KeyRange: leftKeyRange[0],
+					},
+					{
+						Name:     "80-",
+						KeyRange: rightKeyRange[0],
+					},
+				},
+			},
+		},
+	}
+	want = map[topodatapb.TabletType]bool{}
+	tm.tmState.RefreshFromTopoInfo(ctx, nil, ks)
+
+	tm.tmState.mu.Lock()
+	assert.False(t, tm.tmState.isInSrvKeyspace)
+	assert.Equal(t, want, tm.tmState.isShardServing)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(0), statsIsInSrvKeyspace.Get())
+
+	// Shard in the SrvKeyspace, ServedType in the SrvKeyspace
+	ks = &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_MASTER,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "0",
+						KeyRange: keyRange[0],
+					},
+				},
+			},
+		},
+	}
+	want = map[topodatapb.TabletType]bool{
+		topodatapb.TabletType_MASTER: true,
+	}
+	tm.tmState.RefreshFromTopoInfo(ctx, nil, ks)
+
+	tm.tmState.mu.Lock()
+	assert.True(t, tm.tmState.isInSrvKeyspace)
+	assert.Equal(t, want, tm.tmState.isShardServing)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(1), statsIsInSrvKeyspace.Get())
+
+	// Shard in the SrvKeyspace, ServedType not in the SrvKeyspace
+	ks = &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_RDONLY,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "0",
+						KeyRange: keyRange[0],
+					},
+				},
+			},
+		},
+	}
+	want = map[topodatapb.TabletType]bool{
+		topodatapb.TabletType_RDONLY: true,
+	}
+	tm.tmState.RefreshFromTopoInfo(ctx, nil, ks)
+
+	tm.tmState.mu.Lock()
+	assert.False(t, tm.tmState.isInSrvKeyspace)
+	assert.Equal(t, want, tm.tmState.isShardServing)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(0), statsIsInSrvKeyspace.Get())
+
+	// Test tablet type change - shard in the SrvKeyspace, ServedType in the SrvKeyspace
+	err = tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_RDONLY, DBActionNone)
+	require.NoError(t, err)
+	tm.tmState.mu.Lock()
+	assert.True(t, tm.tmState.isInSrvKeyspace)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(1), statsIsInSrvKeyspace.Get())
+
+	// Test tablet type change - shard in the SrvKeyspace, ServedType in the SrvKeyspace
+	err = tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_DRAINED, DBActionNone)
+	require.NoError(t, err)
+	tm.tmState.mu.Lock()
+	assert.False(t, tm.tmState.isInSrvKeyspace)
+	tm.tmState.mu.Unlock()
+
+	assert.Equal(t, int64(0), statsIsInSrvKeyspace.Get())
+}
+
 func TestStateNonServing(t *testing.T) {
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
@@ -168,8 +326,12 @@ func TestStateNonServing(t *testing.T) {
 func TestStateChangeTabletType(t *testing.T) {
 	ctx := context.Background()
 	ts := memorytopo.NewServer("cell1")
+	statsTabletTypeCount.ResetAll()
 	tm := newTestTM(t, ts, 2, "ks", "0")
 	defer tm.Stop()
+
+	assert.Equal(t, 1, len(statsTabletTypeCount.Counts()))
+	assert.Equal(t, int64(1), statsTabletTypeCount.Counts()["replica"])
 
 	alias := &topodatapb.TabletAlias{
 		Cell: "cell1",
@@ -182,6 +344,9 @@ func TestStateChangeTabletType(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, topodatapb.TabletType_MASTER, ti.Type)
 	assert.NotNil(t, ti.MasterTermStartTime)
+	assert.Equal(t, "master", statsTabletType.Get())
+	assert.Equal(t, 2, len(statsTabletTypeCount.Counts()))
+	assert.Equal(t, int64(1), statsTabletTypeCount.Counts()["master"])
 
 	err = tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_REPLICA, DBActionNone)
 	require.NoError(t, err)
@@ -189,6 +354,9 @@ func TestStateChangeTabletType(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, topodatapb.TabletType_REPLICA, ti.Type)
 	assert.Nil(t, ti.MasterTermStartTime)
+	assert.Equal(t, "replica", statsTabletType.Get())
+	assert.Equal(t, 2, len(statsTabletTypeCount.Counts()))
+	assert.Equal(t, int64(2), statsTabletTypeCount.Counts()["replica"])
 }
 
 func TestPublishStateNew(t *testing.T) {
@@ -242,4 +410,31 @@ func TestPublishStateNew(t *testing.T) {
 	ttablet, err = tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
 	require.NoError(t, err)
 	assert.Equal(t, tab2, ttablet.Tablet)
+}
+
+func TestPublishDeleted(t *testing.T) {
+	ctx := context.Background()
+	ts := memorytopo.NewServer("cell1")
+	tm := newTestTM(t, ts, 2, "ks", "0")
+	defer tm.Stop()
+
+	alias := &topodatapb.TabletAlias{
+		Cell: "cell1",
+		Uid:  2,
+	}
+
+	err := tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_MASTER, DBActionSetReadWrite)
+	require.NoError(t, err)
+
+	err = ts.DeleteTablet(ctx, alias)
+	require.NoError(t, err)
+
+	// we need to make sure to catch the signal
+	servenv.ExitChan = make(chan os.Signal, 1)
+	// Now change the tablet type and publish
+	err = tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_REPLICA, DBActionNone)
+	require.NoError(t, err)
+	tm.tmState.mu.Lock()
+	assert.False(t, tm.tmState.isPublishing)
+	tm.tmState.mu.Unlock()
 }

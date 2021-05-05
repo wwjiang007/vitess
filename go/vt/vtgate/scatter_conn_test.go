@@ -19,13 +19,17 @@ package vtgate
 import (
 	"testing"
 
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+
 	"github.com/stretchr/testify/assert"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/key"
 
 	"vitess.io/vitess/go/test/utils"
 
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -293,9 +297,126 @@ func TestReservedConnFail(t *testing.T) {
 
 	session := NewSafeSession(&vtgatepb.Session{InTransaction: false, InReservedConn: true})
 	destinations := []key.Destination{key.DestinationShard("0")}
+
 	executeOnShards(t, res, keyspace, sc, session, destinations)
 	assert.Equal(t, 1, len(session.ShardSessions))
-	sbc0.ShardErr = mysql.NewSQLError(mysql.CRServerGone, mysql.SSUnknownSQLState, "lost connection")
+	oldRId := session.Session.ShardSessions[0].ReservedId
+
+	sbc0.EphemeralShardErr = mysql.NewSQLError(mysql.CRServerGone, mysql.SSUnknownSQLState, "lost connection")
 	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
-	assert.Zero(t, len(session.ShardSessions))
+	assert.Equal(t, 3, len(sbc0.Queries), "1 for the successful run, one for the failed attempt, and one for the retry")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+
+	sbc0.Queries = nil
+	sbc0.EphemeralShardErr = mysql.NewSQLError(mysql.ERQueryInterrupted, mysql.SSUnknownSQLState, "transaction 123 not found")
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 2, len(sbc0.Queries), "one for the failed attempt, and one for the retry")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+
+	sbc0.Queries = nil
+	sbc0.EphemeralShardErr = mysql.NewSQLError(mysql.ERQueryInterrupted, mysql.SSUnknownSQLState, "transaction 123 ended at 2020-01-20")
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 2, len(sbc0.Queries), "one for the failed attempt, and one for the retry")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+
+	sbc0.Queries = nil
+	sbc0.EphemeralShardErr = vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "operation not allowed in state NOT_SERVING during query: query1")
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 2, len(sbc0.Queries), "one for the failed attempt, and one for the retry")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+
+	sbc0.Queries = nil
+	sbc0.EphemeralShardErr = vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "invalid tablet type: REPLICA, want: MASTER or MASTER")
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 2, len(sbc0.Queries), "one for the failed attempt, and one for the retry")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+	oldAlias := session.Session.ShardSessions[0].TabletAlias
+
+	// Test Setup
+	tablet0 := sbc0.Tablet()
+	ths := hc.GetHealthyTabletStats(&querypb.Target{
+		Keyspace:   tablet0.GetKeyspace(),
+		Shard:      tablet0.GetShard(),
+		TabletType: tablet0.GetType(),
+	})
+	sbc0Th := ths[0]
+	sbc0Th.Serving = false
+	sbc0Rep := hc.AddTestTablet("aa", "0", 2, keyspace, "0", topodatapb.TabletType_REPLICA, true, 1, nil)
+
+	sbc0.Queries = nil
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 0, len(sbc0.Queries), "no attempt should be made as the tablet is not serving")
+	assert.Equal(t, 1, len(sbc0Rep.Queries), "first attempt should pass as it is healthy")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	assert.NotEqual(t, oldAlias, session.Session.ShardSessions[0].TabletAlias, "tablet alias should have changed as this is a different tablet")
+	oldRId = session.Session.ShardSessions[0].ReservedId
+	oldAlias = session.Session.ShardSessions[0].TabletAlias
+
+	// Test Setup
+	tablet0Rep := sbc0Rep.Tablet()
+	newThs := hc.GetHealthyTabletStats(&querypb.Target{
+		Keyspace:   tablet0Rep.GetKeyspace(),
+		Shard:      tablet0Rep.GetShard(),
+		TabletType: tablet0Rep.GetType(),
+	})
+	sbc0RepTh := newThs[0]
+	sbc0RepTh.Target = &querypb.Target{
+		Keyspace:   tablet0Rep.GetKeyspace(),
+		Shard:      tablet0Rep.GetShard(),
+		TabletType: topodatapb.TabletType_SPARE,
+	}
+	sbc0Th.Serving = true
+
+	sbc0Rep.Queries = nil
+	_ = executeOnShardsReturnsErr(t, res, keyspace, sc, session, destinations)
+	assert.Equal(t, 1, len(sbc0.Queries), "first attempt should pass as it is healthy and matches the target")
+	assert.Equal(t, 0, len(sbc0Rep.Queries), " no attempt should be made as the tablet target is changed")
+	require.Equal(t, 1, len(session.ShardSessions))
+	assert.NotEqual(t, oldRId, session.Session.ShardSessions[0].ReservedId, "should have recreated a reserved connection since the last connection was lost")
+	assert.NotEqual(t, oldAlias, session.Session.ShardSessions[0].TabletAlias, "tablet alias should have changed as this is a different tablet")
+}
+
+func TestIsConnClosed(t *testing.T) {
+	var testCases = []struct {
+		name      string
+		err       error
+		conClosed bool
+	}{{
+		"server gone",
+		mysql.NewSQLError(mysql.CRServerGone, mysql.SSNetError, ""),
+		true,
+	}, {
+		"connection lost",
+		mysql.NewSQLError(mysql.CRServerLost, mysql.SSNetError, ""),
+		true,
+	}, {
+		"tx ended",
+		mysql.NewSQLError(mysql.ERQueryInterrupted, mysql.SSUnknownSQLState, "transaction 111 ended at ..."),
+		true,
+	}, {
+		"tx not found",
+		mysql.NewSQLError(mysql.ERQueryInterrupted, mysql.SSUnknownSQLState, "transaction 111 not found ..."),
+		true,
+	}, {
+		"tx not found missing tx id",
+		mysql.NewSQLError(mysql.ERQueryInterrupted, mysql.SSUnknownSQLState, "transaction not found"),
+		false,
+	}}
+
+	for _, tCase := range testCases {
+		t.Run(tCase.name, func(t *testing.T) {
+			assert.Equal(t, tCase.conClosed, wasConnectionClosed(tCase.err))
+		})
+	}
 }

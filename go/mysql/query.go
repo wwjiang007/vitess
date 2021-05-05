@@ -253,22 +253,25 @@ func (c *Conn) readColumnDefinitionType(field *querypb.Field, index int) error {
 
 // parseRow parses an individual row.
 // Returns a SQLError.
-func (c *Conn) parseRow(data []byte, fields []*querypb.Field) ([]sqltypes.Value, error) {
+func (c *Conn) parseRow(data []byte, fields []*querypb.Field, reader func([]byte, int) ([]byte, int, bool), result []sqltypes.Value) ([]sqltypes.Value, error) {
 	colNumber := len(fields)
-	result := make([]sqltypes.Value, colNumber)
+	if result == nil {
+		result = make([]sqltypes.Value, 0, colNumber)
+	}
 	pos := 0
 	for i := 0; i < colNumber; i++ {
 		if data[pos] == NullValue {
+			result = append(result, sqltypes.Value{})
 			pos++
 			continue
 		}
 		var s []byte
 		var ok bool
-		s, pos, ok = readLenEncStringAsBytesCopy(data, pos)
+		s, pos, ok = reader(data, pos)
 		if !ok {
 			return nil, NewSQLError(CRMalformedPacket, SSUnknownSQLState, "decoding string failed")
 		}
-		result[i] = sqltypes.MakeTrusted(fields[i].Type, s)
+		result = append(result, sqltypes.MakeTrusted(fields[i].Type, s))
 	}
 	return result, nil
 }
@@ -319,6 +322,9 @@ func (c *Conn) ExecuteFetchMulti(query string, maxrows int, wantfields bool) (re
 	}
 
 	res, more, _, err := c.ReadQueryResult(maxrows, wantfields)
+	if err != nil {
+		return nil, false, err
+	}
 	return res, more, err
 }
 
@@ -358,6 +364,7 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 			RowsAffected:        packetOk.affectedRows,
 			InsertID:            packetOk.lastInsertID,
 			SessionStateChanges: packetOk.sessionStateData,
+			StatusFlags:         packetOk.statusFlags,
 		}, more, warnings, nil
 	}
 
@@ -406,7 +413,7 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 
 	// read each row until EOF or OK packet.
 	for {
-		data, err := c.ReadPacket()
+		data, err := c.readEphemeralPacket()
 		if err != nil {
 			return nil, false, 0, err
 		}
@@ -415,19 +422,23 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 		// https://dev.mysql.com/doc/internals/en/packet-EOF_Packet.html
 		// It will be OK Packet with EOF Header. This needs to change in the code here.
 		if isEOFPacket(data) {
+			defer c.recycleReadPacket()
+
 			// Strip the partial Fields before returning.
 			if !wantfields {
 				result.Fields = nil
 			}
-			result.RowsAffected = uint64(len(result.Rows))
 
 			// The deprecated EOF packets change means that this is either an
 			// EOF packet or an OK packet with the EOF type code.
 			if c.Capabilities&CapabilityClientDeprecateEOF == 0 {
-				warnings, more, err = parseEOFPacket(data)
+				var statusFlags uint16
+				warnings, statusFlags, err = parseEOFPacket(data)
 				if err != nil {
 					return nil, false, 0, err
 				}
+				more = (statusFlags & ServerMoreResultsExists) != 0
+				result.StatusFlags = statusFlags
 			} else {
 				packetOk, err := c.parseOKPacket(data)
 				if err != nil {
@@ -436,16 +447,19 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 				warnings = packetOk.warnings
 				more = (packetOk.statusFlags & ServerMoreResultsExists) != 0
 				result.SessionStateChanges = packetOk.sessionStateData
+				result.StatusFlags = packetOk.statusFlags
 			}
 			return result, more, warnings, nil
 
 		} else if isErrorPacket(data) {
+			defer c.recycleReadPacket()
 			// Error packet.
 			return nil, false, 0, ParseErrorPacket(data)
 		}
 
 		// Check we're not over the limit before we add more.
 		if len(result.Rows) == maxrows {
+			c.recycleReadPacket()
 			if err := c.drainResults(); err != nil {
 				return nil, false, 0, err
 			}
@@ -453,11 +467,13 @@ func (c *Conn) ReadQueryResult(maxrows int, wantfields bool) (*sqltypes.Result, 
 		}
 
 		// Regular row.
-		row, err := c.parseRow(data, result.Fields)
+		row, err := c.parseRow(data, result.Fields, readLenEncStringAsBytesCopy, nil)
 		if err != nil {
+			c.recycleReadPacket()
 			return nil, false, 0, err
 		}
 		result.Rows = append(result.Rows, row)
+		c.recycleReadPacket()
 	}
 }
 
@@ -1009,6 +1025,15 @@ func (c *Conn) writeEndResult(more bool, affectedRows, lastInsertID uint64, warn
 	return nil
 }
 
+// PacketComStmtPrepareOK contains the COM_STMT_PREPARE_OK packet details
+type PacketComStmtPrepareOK struct {
+	status       uint8
+	stmtID       uint32
+	numCols      uint16
+	numParams    uint16
+	warningCount uint16
+}
+
 // writePrepare writes a prepare query response to the wire.
 func (c *Conn) writePrepare(fld []*querypb.Field, prepare *PrepareData) error {
 	paramsCount := prepare.ParamsCount
@@ -1020,14 +1045,21 @@ func (c *Conn) writePrepare(fld []*querypb.Field, prepare *PrepareData) error {
 		prepare.ColumnNames = make([]string, columnCount)
 	}
 
-	data, pos := c.startEphemeralPacketWithHeader(12)
-
-	pos = writeByte(data, pos, 0x00)
-	pos = writeUint32(data, pos, uint32(prepare.StatementID))
-	pos = writeUint16(data, pos, uint16(columnCount))
-	pos = writeUint16(data, pos, uint16(paramsCount))
-	pos = writeByte(data, pos, 0x00)
-	writeUint16(data, pos, 0x0000)
+	ok := PacketComStmtPrepareOK{
+		status:       OKPacket,
+		stmtID:       prepare.StatementID,
+		numCols:      (uint16)(columnCount),
+		numParams:    paramsCount,
+		warningCount: 0,
+	}
+	bytes, pos := c.startEphemeralPacketWithHeader(12)
+	data := &coder{data: bytes, pos: pos}
+	data.writeByte(ok.status)
+	data.writeUint32(ok.stmtID)
+	data.writeUint16(ok.numCols)
+	data.writeUint16(ok.numParams)
+	data.writeByte(0x00) // reserved 1 byte
+	data.writeUint16(ok.warningCount)
 
 	if err := c.writeEphemeralPacket(); err != nil {
 		return err

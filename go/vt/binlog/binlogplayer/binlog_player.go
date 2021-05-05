@@ -29,8 +29,9 @@ import (
 
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/history"
 	"vitess.io/vitess/go/mysql"
@@ -79,17 +80,35 @@ type Stats struct {
 	lastPositionMutex sync.Mutex
 	lastPosition      mysql.Position
 
+	heartbeatMutex sync.Mutex
+	heartbeat      int64
+
 	SecondsBehindMaster sync2.AtomicInt64
 	History             *history.History
 
 	State sync2.AtomicString
 
-	PhaseTimings  *stats.Timings
-	QueryTimings  *stats.Timings
-	QueryCount    *stats.CountersWithSingleLabel
-	CopyRowCount  *stats.Counter
-	CopyLoopCount *stats.Counter
-	ErrorCounts   *stats.CountersWithMultiLabels
+	PhaseTimings   *stats.Timings
+	QueryTimings   *stats.Timings
+	QueryCount     *stats.CountersWithSingleLabel
+	CopyRowCount   *stats.Counter
+	CopyLoopCount  *stats.Counter
+	ErrorCounts    *stats.CountersWithMultiLabels
+	NoopQueryCount *stats.CountersWithSingleLabel
+}
+
+// RecordHeartbeat updates the time the last heartbeat from vstreamer was seen
+func (bps *Stats) RecordHeartbeat(tm int64) {
+	bps.heartbeatMutex.Lock()
+	defer bps.heartbeatMutex.Unlock()
+	bps.heartbeat = tm
+}
+
+// Heartbeat gets the time the last heartbeat from vstreamer was seen
+func (bps *Stats) Heartbeat() int64 {
+	bps.heartbeatMutex.Lock()
+	defer bps.heartbeatMutex.Unlock()
+	return bps.heartbeat
 }
 
 // SetLastPosition sets the last replication position.
@@ -131,6 +150,7 @@ func NewStats() *Stats {
 	bps.CopyRowCount = stats.NewCounter("", "")
 	bps.CopyLoopCount = stats.NewCounter("", "")
 	bps.ErrorCounts = stats.NewCountersWithMultiLabels("", "", []string{"type"})
+	bps.NoopQueryCount = stats.NewCountersWithSingleLabel("", "", "Statement", "")
 	return bps
 }
 
@@ -456,7 +476,7 @@ func (blp *BinlogPlayer) writeRecoveryPosition(tx *binlogdatapb.BinlogTransactio
 	}
 
 	now := time.Now().Unix()
-	updateRecovery := GenerateUpdatePos(blp.uid, position, now, tx.EventToken.Timestamp)
+	updateRecovery := GenerateUpdatePos(blp.uid, position, now, tx.EventToken.Timestamp, blp.blplStats.CopyRowCount.Get())
 
 	qr, err := blp.exec(updateRecovery)
 	if err != nil {
@@ -533,6 +553,13 @@ func CreateVReplicationTable() []string {
 var AlterVReplicationTable = []string{
 	"ALTER TABLE _vt.vreplication ADD COLUMN db_name VARBINARY(255) NOT NULL",
 	"ALTER TABLE _vt.vreplication MODIFY source BLOB NOT NULL",
+	"ALTER TABLE _vt.vreplication ADD KEY workflow_idx (workflow(64))",
+	"ALTER TABLE _vt.vreplication ADD COLUMN rows_copied BIGINT(20) NOT NULL DEFAULT 0",
+}
+
+var WithDDLInitialQueries = []string{
+	"SELECT db_name FROM _vt.vreplication LIMIT 0",
+	"SELECT rows_copied FROM _vt.vreplication LIMIT 0",
 }
 
 // VRSettings contains the settings of a vreplication table.
@@ -603,27 +630,24 @@ func CreateVReplicationState(workflow string, source *binlogdatapb.BinlogSource,
 
 // GenerateUpdatePos returns a statement to update a value in the
 // _vt.vreplication table.
-func GenerateUpdatePos(uid uint32, pos mysql.Position, timeUpdated int64, txTimestamp int64) string {
+func GenerateUpdatePos(uid uint32, pos mysql.Position, timeUpdated int64, txTimestamp int64, rowsCopied int64) string {
 	if txTimestamp != 0 {
 		return fmt.Sprintf(
-			"update _vt.vreplication set pos=%v, time_updated=%v, transaction_timestamp=%v, message='' where id=%v",
-			encodeString(mysql.EncodePosition(pos)), timeUpdated, txTimestamp, uid)
+			"update _vt.vreplication set pos=%v, time_updated=%v, transaction_timestamp=%v, rows_copied=%v, message='' where id=%v",
+			encodeString(mysql.EncodePosition(pos)), timeUpdated, txTimestamp, rowsCopied, uid)
 	}
 
 	return fmt.Sprintf(
-		"update _vt.vreplication set pos=%v, time_updated=%v, message='' where id=%v",
-		encodeString(mysql.EncodePosition(pos)), timeUpdated, uid)
+		"update _vt.vreplication set pos=%v, time_updated=%v, rows_copied=%v, message='' where id=%v",
+		encodeString(mysql.EncodePosition(pos)), timeUpdated, rowsCopied, uid)
 }
 
-// GenerateUpdateTime returns a statement to update time_updated and transaction_timestamp in the
-// _vt.vreplication table.
-func GenerateUpdateTime(uid uint32, timeUpdated int64, txTimestamp int64) (string, error) {
-	if timeUpdated == 0 || txTimestamp == 0 {
-		return "", fmt.Errorf("invalid timeUpdated or txTimestamp supplied")
+// GenerateUpdateTime returns a statement to update time_updated in the _vt.vreplication table.
+func GenerateUpdateTime(uid uint32, timeUpdated int64) (string, error) {
+	if timeUpdated == 0 {
+		return "", fmt.Errorf("timeUpdated cannot be zero")
 	}
-	return fmt.Sprintf(
-		"update _vt.vreplication set time_updated=%v, transaction_timestamp=%v where id=%v",
-		timeUpdated, txTimestamp, uid), nil
+	return fmt.Sprintf("update _vt.vreplication set time_updated=%v where id=%v", timeUpdated, uid), nil
 }
 
 // StartVReplication returns a statement to start the replication.

@@ -18,9 +18,7 @@ package planbuilder
 
 import (
 	"vitess.io/vitess/go/sqltypes"
-	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
@@ -36,15 +34,9 @@ func (pb *primitiveBuilder) findSysInfoRoutingPredicates(expr sqlparser.Expr, ru
 	}
 
 	if isTableSchema {
-		if rut.eroute.SysTableTableSchema != nil {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "two predicates for table_schema not supported")
-		}
-		rut.eroute.SysTableTableSchema = out
+		rut.eroute.SysTableTableSchema = append(rut.eroute.SysTableTableSchema, out)
 	} else {
-		if rut.eroute.SysTableTableName != nil {
-			return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "two predicates for table_name not supported")
-		}
-		rut.eroute.SysTableTableName = out
+		rut.eroute.SysTableTableName = append(rut.eroute.SysTableTableName, out)
 	}
 
 	return nil
@@ -70,7 +62,15 @@ func isTableSchemaOrName(e sqlparser.Expr) (isTableSchema bool, isTableName bool
 	if !ok {
 		return false, false
 	}
-	return col.Name.EqualString("table_schema"), col.Name.EqualString("table_name")
+	return isDbNameCol(col), isTableNameCol(col)
+}
+
+func isDbNameCol(col *sqlparser.ColName) bool {
+	return col.Name.EqualString("table_schema") || col.Name.EqualString("constraint_schema") || col.Name.EqualString("schema_name") || col.Name.EqualString("routine_schema")
+}
+
+func isTableNameCol(col *sqlparser.ColName) bool {
+	return col.Name.EqualString("table_name")
 }
 
 func extractInfoSchemaRoutingPredicate(in sqlparser.Expr) (bool, evalengine.Expr, error) {
@@ -88,13 +88,13 @@ func extractInfoSchemaRoutingPredicate(in sqlparser.Expr) (bool, evalengine.Expr
 					}
 					return false, nil, err
 				}
-				name := ":"
+				var name string
 				if isSchemaName {
-					name += sqltypes.BvSchemaName
+					name = sqltypes.BvSchemaName
 				} else {
-					name += engine.BvTableName
+					name = engine.BvTableName
 				}
-				replaceOther(sqlparser.NewArgument([]byte(name)))
+				replaceOther(sqlparser.NewArgument(name))
 				return isSchemaName, evalExpr, nil
 			}
 		}

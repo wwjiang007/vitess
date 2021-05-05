@@ -20,7 +20,12 @@ import (
 	"reflect"
 	"testing"
 
+	"vitess.io/vitess/go/mysql"
+
+	"vitess.io/vitess/go/test/utils"
+
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/vttablet/endtoend/framework"
@@ -76,7 +81,6 @@ func TestBatchRead(t *testing.T) {
 			Charset:      63,
 			Flags:        128,
 		}},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewInt64(1),
@@ -85,6 +89,7 @@ func TestBatchRead(t *testing.T) {
 				sqltypes.NewVarBinary("fghi"),
 			},
 		},
+		StatusFlags: sqltypes.ServerStatusNoIndexUsed | sqltypes.ServerStatusAutocommit,
 	}
 	qr2 := sqltypes.Result{
 		Fields: []*querypb.Field{{
@@ -108,21 +113,19 @@ func TestBatchRead(t *testing.T) {
 			Charset:      63,
 			Flags:        49155,
 		}},
-		RowsAffected: 1,
 		Rows: [][]sqltypes.Value{
 			{
 				sqltypes.NewInt64(1),
 				sqltypes.NewInt32(2),
 			},
 		},
+		StatusFlags: sqltypes.ServerStatusAutocommit,
 	}
 	want := []sqltypes.Result{qr1, qr2}
 
 	qrl, err := client.ExecuteBatch(queries, false)
 	require.NoError(t, err)
-	if !reflect.DeepEqual(qrl, want) {
-		t.Errorf("ExecueBatch: \n%#v, want \n%#v", prettyPrintArr(qrl), prettyPrintArr(want))
-	}
+	utils.MustMatch(t, want, qrl)
 }
 
 func TestBatchTransaction(t *testing.T) {
@@ -177,7 +180,6 @@ func TestBatchTransaction(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Rollback()
 		qrl, err = client.ExecuteBatch(queries, true)
-		want := "cannot start a new transaction in the scope of an existing one"
-		require.EqualError(t, err, want)
+		require.EqualError(t, mysql.NewSQLErrorFromError(err), "You are not allowed to execute this command in a transaction (errno 1179) (sqlstate 25000)")
 	}()
 }

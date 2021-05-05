@@ -30,13 +30,101 @@ import (
 
 	"vitess.io/vitess/go/vt/log"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
+
+func TestHeartbeatFrequencyFlag(t *testing.T) {
+	origVReplicationHeartbeatUpdateInterval := *vreplicationHeartbeatUpdateInterval
+	defer func() {
+		*vreplicationHeartbeatUpdateInterval = origVReplicationHeartbeatUpdateInterval
+	}()
+
+	stats := binlogplayer.NewStats()
+	vp := &vplayer{vr: &vreplicator{dbClient: newVDBClient(realDBClientFactory(), stats), stats: stats}}
+
+	type testcount struct {
+		count      int
+		mustUpdate bool
+	}
+	type testcase struct {
+		name     string
+		interval int
+		counts   []testcount
+	}
+	testcases := []*testcase{
+		{"default frequency", 1, []testcount{{count: 0, mustUpdate: false}, {1, true}}},
+		{"custom frequency", 4, []testcount{{count: 0, mustUpdate: false}, {count: 3, mustUpdate: false}, {4, true}}},
+		{"minumum frequency", 61, []testcount{{count: 59, mustUpdate: false}, {count: 60, mustUpdate: true}, {61, true}}},
+	}
+	for _, tcase := range testcases {
+		t.Run(tcase.name, func(t *testing.T) {
+			*vreplicationHeartbeatUpdateInterval = tcase.interval
+			for _, tcount := range tcase.counts {
+				vp.numAccumulatedHeartbeats = tcount.count
+				require.Equal(t, tcount.mustUpdate, vp.mustUpdateCurrentTime())
+			}
+		})
+	}
+}
+
+func TestVReplicationTimeUpdated(t *testing.T) {
+	ctx := context.Background()
+	defer deleteTablet(addTablet(100))
+
+	execStatements(t, []string{
+		"create table t1(id int, val varbinary(128), primary key(id))",
+		fmt.Sprintf("create table %s.t1(id int, val varbinary(128), primary key(id))", vrepldb),
+	})
+	defer execStatements(t, []string{
+		"drop table t1",
+		fmt.Sprintf("drop table %s.t1", vrepldb),
+	})
+	env.SchemaEngine.Reload(context.Background())
+
+	filter := &binlogdatapb.Filter{
+		Rules: []*binlogdatapb.Rule{{
+			Match: "/.*",
+		}},
+	}
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	cancel, _ := startVReplication(t, bls, "")
+	defer cancel()
+
+	execStatements(t, []string{
+		"insert into t1 values(1, 'aaa')",
+	})
+
+	var getTimestamps = func() (int64, int64) {
+		qr, err := env.Mysqld.FetchSuperQuery(ctx, "select time_updated, transaction_timestamp from _vt.vreplication")
+		require.NoError(t, err)
+		require.NotNil(t, qr)
+		require.Equal(t, 1, len(qr.Rows))
+		timeUpdated, err := qr.Rows[0][0].ToInt64()
+		require.NoError(t, err)
+		transactionTimestamp, err := qr.Rows[0][1].ToInt64()
+		require.NoError(t, err)
+		return timeUpdated, transactionTimestamp
+	}
+	expectNontxQueries(t, []string{
+		"insert into t1(id,val) values (1,'aaa')",
+	})
+	time.Sleep(1 * time.Second)
+	timeUpdated1, transactionTimestamp1 := getTimestamps()
+	time.Sleep(2 * time.Second)
+	timeUpdated2, _ := getTimestamps()
+	require.Greater(t, timeUpdated2, timeUpdated1, "time_updated not updated")
+	require.Greater(t, timeUpdated2, transactionTimestamp1, "transaction_timestamp should not be < time_updated")
+}
 
 func TestCharPK(t *testing.T) {
 	defer deleteTablet(addTablet(100))
@@ -164,7 +252,6 @@ func TestCharPK(t *testing.T) {
 		}
 	}
 }
-
 func TestRollup(t *testing.T) {
 	defer deleteTablet(addTablet(100))
 
@@ -1217,7 +1304,16 @@ func TestPlayerRowMove(t *testing.T) {
 
 func TestPlayerTypes(t *testing.T) {
 	log.Errorf("TestPlayerTypes: flavor is %s", env.Flavor)
-
+	enableJSONColumnTesting := false
+	flavor := strings.ToLower(env.Flavor)
+	// Disable tests on percona (which identifies as mysql56) and mariadb platforms in CI since they
+	// either don't support JSON or JSON support is not enabled by default
+	if strings.Contains(flavor, "mysql57") || strings.Contains(flavor, "mysql80") {
+		log.Infof("Running JSON column type tests on flavor %s", flavor)
+		enableJSONColumnTesting = true
+	} else {
+		log.Warningf("Not running JSON column type tests on flavor %s", flavor)
+	}
 	defer deleteTablet(addTablet(100))
 
 	execStatements(t, []string{
@@ -1250,7 +1346,7 @@ func TestPlayerTypes(t *testing.T) {
 		"drop table binary_pk",
 		fmt.Sprintf("drop table %s.binary_pk", vrepldb),
 	})
-	if strings.Contains(env.Flavor, "mysql57") {
+	if enableJSONColumnTesting {
 		execStatements(t, []string{
 			"create table vitess_json(id int auto_increment, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))",
 			fmt.Sprintf("create table %s.vitess_json(id int, val1 json, val2 json, val3 json, val4 json, val5 json, primary key(id))", vrepldb),
@@ -1333,8 +1429,7 @@ func TestPlayerTypes(t *testing.T) {
 			{"a\x00\x00\x00", "bbb"},
 		},
 	}}
-
-	if strings.Contains(env.Flavor, "mysql57") {
+	if enableJSONColumnTesting {
 		testcases = append(testcases, testcase{
 			input: "insert into vitess_json(val1,val2,val3,val4,val5) values (null,'{}','123','{\"a\":[42,100]}', '{\"foo\":\"bar\"}')",
 			output: "insert into vitess_json(id,val1,val2,val3,val4,val5) values (1," +
@@ -1343,6 +1438,14 @@ func TestPlayerTypes(t *testing.T) {
 			table: "vitess_json",
 			data: [][]string{
 				{"1", "", "{}", "123", `{"a": [42, 100]}`, `{"foo": "bar"}`},
+			},
+		})
+		testcases = append(testcases, testcase{
+			input:  "update vitess_json set val4 = '{\"a\": [98, 123]}', val5 = convert(x'7b7d' using utf8mb4)",
+			output: "update vitess_json set val1=convert(null using utf8mb4), val2=convert('{}' using utf8mb4), val3=convert('123' using utf8mb4), val4=convert('{\\\"a\\\":[98,123]}' using utf8mb4), val5=convert('{}' using utf8mb4) where id=1",
+			table:  "vitess_json",
+			data: [][]string{
+				{"1", "", "{}", "123", `{"a": [98, 123]}`, `{}`},
 			},
 		})
 	}
@@ -1435,6 +1538,7 @@ func TestPlayerDDL(t *testing.T) {
 	expectDBClientQueries(t, []string{
 		"/update.*'Running'",
 		// Second update is from vreplicator.
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update.*'Running'",
 		"begin",
 		fmt.Sprintf("/update.*'%s'", pos2),
@@ -1544,6 +1648,7 @@ func TestPlayerStopPos(t *testing.T) {
 	expectDBClientQueries(t, []string{
 		"/update.*'Running'",
 		// Second update is from vreplicator.
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update.*'Running'",
 		"begin",
 		"insert into yes(id,val) values (1,'aaa')",
@@ -1568,6 +1673,7 @@ func TestPlayerStopPos(t *testing.T) {
 	expectDBClientQueries(t, []string{
 		"/update.*'Running'",
 		// Second update is from vreplicator.
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update.*'Running'",
 		"begin",
 		// Since 'no' generates empty transactions that are skipped by
@@ -1585,6 +1691,7 @@ func TestPlayerStopPos(t *testing.T) {
 	expectDBClientQueries(t, []string{
 		"/update.*'Running'",
 		// Second update is from vreplicator.
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update.*'Running'",
 		"/update.*'Stopped'.*already reached",
 	})
@@ -2058,11 +2165,11 @@ func TestPlayerRelayLogMaxSize(t *testing.T) {
 			case 0:
 				savedSize := relayLogMaxSize
 				defer func() { relayLogMaxSize = savedSize }()
-				relayLogMaxSize = 10
+				*relayLogMaxSize = 10
 			case 1:
 				savedLen := relayLogMaxItems
 				defer func() { relayLogMaxItems = savedLen }()
-				relayLogMaxItems = 2
+				*relayLogMaxItems = 2
 			}
 
 			execStatements(t, []string{
@@ -2204,6 +2311,7 @@ func TestRestartOnVStreamEnd(t *testing.T) {
 		"insert into t1 values(2, 'aaa')",
 	})
 	expectDBClientQueries(t, []string{
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running'",
 		"begin",
 		"insert into t1(id,val) values (2,'aaa')",
@@ -2348,6 +2456,32 @@ func TestPlayerJSONDocs(t *testing.T) {
 	}
 }
 
+func TestVReplicationLogs(t *testing.T) {
+	defer deleteTablet(addTablet(100))
+	dbClient := playerEngine.dbClientFactoryDba()
+	err := dbClient.Connect()
+	require.NoError(t, err)
+	defer dbClient.Close()
+	vdbc := newVDBClient(dbClient, binlogplayer.NewStats())
+	query := "select vrepl_id, state, message, count from _vt.vreplication_log order by id desc limit 1"
+
+	expected := []string{
+		"[[INT32(1) VARBINARY(\"Running\") TEXT(\"message1\") INT64(1)]]",
+		"[[INT32(1) VARBINARY(\"Running\") TEXT(\"message1\") INT64(2)]]",
+	}
+
+	for _, want := range expected {
+		t.Run("", func(t *testing.T) {
+			err = insertLog(vdbc, LogMessage, 1, "Running", "message1")
+			require.NoError(t, err)
+			qr, err := env.Mysqld.FetchSuperQuery(context.Background(), query)
+			require.NoError(t, err)
+			require.Equal(t, want, fmt.Sprintf("%v", qr.Rows))
+		})
+
+	}
+}
+
 func expectJSON(t *testing.T, table string, values [][]string, id int, exec func(ctx context.Context, query string) (*sqltypes.Result, error)) {
 	t.Helper()
 
@@ -2395,9 +2529,9 @@ func startVReplication(t *testing.T, bls *binlogdatapb.BinlogSource, pos string)
 	}
 	expectDBClientQueries(t, []string{
 		"/insert into _vt.vreplication",
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running'",
 	})
-
 	var once sync.Once
 	return func() {
 		t.Helper()

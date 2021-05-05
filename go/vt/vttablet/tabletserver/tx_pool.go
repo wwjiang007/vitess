@@ -26,7 +26,7 @@ import (
 
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/timer"
@@ -112,11 +112,10 @@ func (tp *TxPool) AdjustLastID(id int64) {
 	tp.scp.AdjustLastID(id)
 }
 
-// RollbackNonBusy rolls back all transactions that are not in use.
-// Transactions can be in use for situations like executing statements
-// or in prepared state.
-func (tp *TxPool) RollbackNonBusy(ctx context.Context) {
-	for _, v := range tp.scp.GetOutdated(time.Duration(0), "for transition") {
+// Shutdown immediately rolls back all transactions that are not in use.
+// In-use connections will be closed when they are unlocked (not in use).
+func (tp *TxPool) Shutdown(ctx context.Context) {
+	for _, v := range tp.scp.ShutdownAll() {
 		tp.RollbackAndRelease(ctx, v)
 	}
 }
@@ -232,6 +231,9 @@ func (tp *TxPool) Begin(ctx context.Context, options *querypb.ExecuteOptions, re
 	var err error
 	if reservedID != 0 {
 		conn, err = tp.scp.GetAndLock(reservedID, "start transaction on reserve conn")
+		if err != nil {
+			return nil, "", vterrors.Errorf(vtrpcpb.Code_ABORTED, "transaction %d: %v", reservedID, err)
+		}
 	} else {
 		immediateCaller := callerid.ImmediateCallerIDFromContext(ctx)
 		effectiveCaller := callerid.EffectiveCallerIDFromContext(ctx)
@@ -296,7 +298,7 @@ func createTransaction(ctx context.Context, options *querypb.ExecuteOptions, con
 		if queries.setIsolationLevel != "" {
 			txQuery := "set transaction isolation level " + queries.setIsolationLevel
 			if err := conn.execWithRetry(ctx, txQuery, 1, false); err != nil {
-				return "", false, vterrors.Wrap(err, txQuery)
+				return "", false, err
 			}
 			beginQueries = queries.setIsolationLevel + "; "
 		}
@@ -306,7 +308,7 @@ func createTransaction(ctx context.Context, options *querypb.ExecuteOptions, con
 			beginSQL = "start transaction read only"
 		}
 		if err := conn.execWithRetry(ctx, beginSQL, 1, false); err != nil {
-			return "", false, vterrors.Wrap(err, beginSQL)
+			return "", false, err
 		}
 		beginQueries = beginQueries + beginSQL
 	} else if options.GetTransactionIsolation() == querypb.ExecuteOptions_AUTOCOMMIT {
@@ -317,7 +319,7 @@ func createTransaction(ctx context.Context, options *querypb.ExecuteOptions, con
 
 	for _, preQuery := range preQueries {
 		if _, err := conn.Exec(ctx, preQuery, 1, false); err != nil {
-			return "", false, vterrors.Wrap(err, preQuery)
+			return "", false, err
 		}
 	}
 	return beginQueries, autocommitTransaction, nil

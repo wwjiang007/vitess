@@ -23,9 +23,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/errgroup"
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 
 	"vitess.io/vitess/go/mysql"
+
+	"github.com/prometheus/common/log"
+
+	"vitess.io/vitess/go/vt/vtgate/semantics"
+
+	"golang.org/x/sync/errgroup"
 
 	"vitess.io/vitess/go/vt/callerid"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -35,9 +41,10 @@ import (
 
 	"vitess.io/vitess/go/vt/vtgate/planbuilder"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/discovery"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/srvtopo"
@@ -65,9 +72,12 @@ type iExecute interface {
 	StreamExecuteMulti(ctx context.Context, s string, rss []*srvtopo.ResolvedShard, vars []map[string]*querypb.BindVariable, options *querypb.ExecuteOptions, callback func(reply *sqltypes.Result) error) error
 	ExecuteLock(ctx context.Context, rs *srvtopo.ResolvedShard, query *querypb.BoundQuery, session *SafeSession) (*sqltypes.Result, error)
 	Commit(ctx context.Context, safeSession *SafeSession) error
+	ExecuteMessageStream(ctx context.Context, rss []*srvtopo.ResolvedShard, name string, callback func(*sqltypes.Result) error) error
+	ExecuteVStream(ctx context.Context, rss []*srvtopo.ResolvedShard, filter *binlogdatapb.Filter, gtid string, callback func(evs []*binlogdatapb.VEvent) error) error
 
 	// TODO: remove when resolver is gone
 	ParseDestinationTarget(targetString string) (string, topodatapb.TabletType, key.Destination, error)
+	VSchema() *vindexes.VSchema
 }
 
 //VSchemaOperator is an interface to Vschema Operations
@@ -97,50 +107,28 @@ type vcursorImpl struct {
 	ignoreMaxMemoryRows   bool
 	vschema               *vindexes.VSchema
 	vm                    VSchemaOperator
-}
+	semTable              *semantics.SemTable
+	warnShardedOnly       bool // when using sharded only features, a warning will be warnings field
 
-func (vc *vcursorImpl) ExecuteVSchema(keyspace string, vschemaDDL *sqlparser.DDL) error {
-	srvVschema := vc.vm.GetCurrentSrvVschema()
-	if srvVschema == nil {
-		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema not loaded")
-	}
-
-	allowed := vschemaacl.Authorized(callerid.ImmediateCallerIDFromContext(vc.ctx))
-	if !allowed {
-		return vterrors.Errorf(vtrpcpb.Code_PERMISSION_DENIED, "not authorized to perform vschema operations")
-
-	}
-
-	// Resolve the keyspace either from the table qualifier or the target keyspace
-	var ksName string
-	if !vschemaDDL.Table.IsEmpty() {
-		ksName = vschemaDDL.Table.Qualifier.String()
-	}
-	if ksName == "" {
-		ksName = keyspace
-	}
-	if ksName == "" {
-		return errNoKeyspace
-	}
-
-	ks := srvVschema.Keyspaces[ksName]
-	ks, err := topotools.ApplyVSchemaDDL(ksName, ks, vschemaDDL)
-
-	if err != nil {
-		return err
-	}
-
-	srvVschema.Keyspaces[ksName] = ks
-
-	return vc.vm.UpdateVSchema(vc.ctx, ksName, srvVschema)
-
+	warnings []*querypb.QueryWarning // any warnings that are accumulated during the planning phase are stored here
 }
 
 // newVcursorImpl creates a vcursorImpl. Before creating this object, you have to separate out any marginComments that came with
 // the query and supply it here. Trailing comments are typically sent by the application for various reasons,
 // including as identifying markers. So, they have to be added back to all queries that are executed
 // on behalf of the original query.
-func newVCursorImpl(ctx context.Context, safeSession *SafeSession, marginComments sqlparser.MarginComments, executor *Executor, logStats *LogStats, vm VSchemaOperator, vschema *vindexes.VSchema, resolver *srvtopo.Resolver, serv srvtopo.Server) (*vcursorImpl, error) {
+func newVCursorImpl(
+	ctx context.Context,
+	safeSession *SafeSession,
+	marginComments sqlparser.MarginComments,
+	executor *Executor,
+	logStats *LogStats,
+	vm VSchemaOperator,
+	vschema *vindexes.VSchema,
+	resolver *srvtopo.Resolver,
+	serv srvtopo.Server,
+	warnShardedOnly bool,
+) (*vcursorImpl, error) {
 	keyspace, tabletType, destination, err := parseDestinationTarget(safeSession.TargetString, vschema)
 	if err != nil {
 		return nil, err
@@ -148,10 +136,12 @@ func newVCursorImpl(ctx context.Context, safeSession *SafeSession, marginComment
 
 	// With DiscoveryGateway transactions are only allowed on master.
 	if UsingLegacyGateway() && safeSession.InTransaction() && tabletType != topodatapb.TabletType_MASTER {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "newVCursorImpl: transactions are supported only for master tablet types, current type: %v", tabletType)
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "transaction is supported only for master tablet type, current type: %v", tabletType)
 	}
 	var ts *topo.Server
-	if serv != nil {
+	// We don't have access to the underlying TopoServer if this vtgate is
+	// filtering keyspaces because we don't have an accurate view of the topo.
+	if serv != nil && !discovery.FilteringKeyspaces() {
 		ts, err = serv.GetTopoServer()
 		if err != nil {
 			return nil, err
@@ -159,18 +149,19 @@ func newVCursorImpl(ctx context.Context, safeSession *SafeSession, marginComment
 	}
 
 	return &vcursorImpl{
-		ctx:            ctx,
-		safeSession:    safeSession,
-		keyspace:       keyspace,
-		tabletType:     tabletType,
-		destination:    destination,
-		marginComments: marginComments,
-		executor:       executor,
-		logStats:       logStats,
-		resolver:       resolver,
-		vschema:        vschema,
-		vm:             vm,
-		topoServer:     ts,
+		ctx:             ctx,
+		safeSession:     safeSession,
+		keyspace:        keyspace,
+		tabletType:      tabletType,
+		destination:     destination,
+		marginComments:  marginComments,
+		executor:        executor,
+		logStats:        logStats,
+		resolver:        resolver,
+		vschema:         vschema,
+		vm:              vm,
+		topoServer:      ts,
+		warnShardedOnly: warnShardedOnly,
 	}, nil
 }
 
@@ -203,10 +194,13 @@ func (vc *vcursorImpl) SetContextTimeout(timeout time.Duration) context.CancelFu
 }
 
 // ErrorGroupCancellableContext updates context that can be cancelled.
-func (vc *vcursorImpl) ErrorGroupCancellableContext() *errgroup.Group {
+func (vc *vcursorImpl) ErrorGroupCancellableContext() (*errgroup.Group, func()) {
+	origCtx := vc.ctx
 	g, ctx := errgroup.WithContext(vc.ctx)
 	vc.ctx = ctx
-	return g
+	return g, func() {
+		vc.ctx = origCtx
+	}
 }
 
 // RecordWarning stores the given warning in the current session
@@ -255,7 +249,7 @@ func (vc *vcursorImpl) FindTableOrVindex(name sqlparser.TableName) (*vindexes.Ta
 		return nil, nil, "", destTabletType, nil, err
 	}
 	if destKeyspace == "" {
-		destKeyspace = vc.keyspace
+		destKeyspace = vc.getActualKeyspace()
 	}
 	table, vindex, err := vc.vschema.FindTableOrVindex(destKeyspace, name.Name.String(), vc.tabletType)
 	if err != nil {
@@ -264,19 +258,32 @@ func (vc *vcursorImpl) FindTableOrVindex(name sqlparser.TableName) (*vindexes.Ta
 	return table, vindex, destKeyspace, destTabletType, dest, nil
 }
 
+func (vc *vcursorImpl) getActualKeyspace() string {
+	if !sqlparser.SystemSchema(vc.keyspace) {
+		return vc.keyspace
+	}
+	ks, err := vc.AnyKeyspace()
+	if err != nil {
+		return ""
+	}
+	return ks.Name
+}
+
 // DefaultKeyspace returns the default keyspace of the current request
 // if there is one. If the keyspace specified in the target cannot be
 // identified, it returns an error.
 func (vc *vcursorImpl) DefaultKeyspace() (*vindexes.Keyspace, error) {
-	if vc.keyspace == "" {
+	if ignoreKeyspace(vc.keyspace) {
 		return nil, errNoKeyspace
 	}
 	ks, ok := vc.vschema.Keyspaces[vc.keyspace]
 	if !ok {
-		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "keyspace %s not found in vschema", vc.keyspace)
+		return nil, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", vc.keyspace)
 	}
 	return ks.Keyspace, nil
 }
+
+var errNoDbAvailable = vterrors.NewErrorf(vtrpcpb.Code_FAILED_PRECONDITION, vterrors.NoDB, "no database available")
 
 func (vc *vcursorImpl) AnyKeyspace() (*vindexes.Keyspace, error) {
 	keyspace, err := vc.DefaultKeyspace()
@@ -288,7 +295,7 @@ func (vc *vcursorImpl) AnyKeyspace() (*vindexes.Keyspace, error) {
 	}
 
 	if len(vc.vschema.Keyspaces) == 0 {
-		return nil, vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "no keyspaces available")
+		return nil, errNoDbAvailable
 	}
 
 	// Looks for any sharded keyspace if present, otherwise take any keyspace.
@@ -303,7 +310,7 @@ func (vc *vcursorImpl) AnyKeyspace() (*vindexes.Keyspace, error) {
 
 func (vc *vcursorImpl) FirstSortedKeyspace() (*vindexes.Keyspace, error) {
 	if len(vc.vschema.Keyspaces) == 0 {
-		return nil, vterrors.New(vtrpcpb.Code_FAILED_PRECONDITION, "no keyspaces available")
+		return nil, errNoDbAvailable
 	}
 	kss := vc.vschema.Keyspaces
 	keys := make([]string, 0, len(kss))
@@ -313,6 +320,56 @@ func (vc *vcursorImpl) FirstSortedKeyspace() (*vindexes.Keyspace, error) {
 	sort.Strings(keys)
 
 	return kss[keys[0]].Keyspace, nil
+}
+
+// SysVarSetEnabled implements the ContextVSchema interface
+func (vc *vcursorImpl) SysVarSetEnabled() bool {
+	return vc.GetSessionEnableSystemSettings()
+}
+
+// KeyspaceExists provides whether the keyspace exists or not.
+func (vc *vcursorImpl) KeyspaceExists(ks string) bool {
+	return vc.vschema.Keyspaces[ks] != nil
+}
+
+// AllKeyspace implements the ContextVSchema interface
+func (vc *vcursorImpl) AllKeyspace() ([]*vindexes.Keyspace, error) {
+	if len(vc.vschema.Keyspaces) == 0 {
+		return nil, errNoDbAvailable
+	}
+	var kss []*vindexes.Keyspace
+	for _, ks := range vc.vschema.Keyspaces {
+		kss = append(kss, ks.Keyspace)
+	}
+	return kss, nil
+}
+
+// Planner implements the ContextVSchema interface
+func (vc *vcursorImpl) Planner() planbuilder.PlannerVersion {
+	if vc.safeSession.Options != nil &&
+		vc.safeSession.Options.PlannerVersion != querypb.ExecuteOptions_DEFAULT_PLANNER {
+		return vc.safeSession.Options.PlannerVersion
+	}
+	switch strings.ToLower(*plannerVersion) {
+	case "v3":
+		return planbuilder.V3
+	case "gen4":
+		return planbuilder.Gen4
+	case "gen4greedy", "greedy":
+		return planbuilder.Gen4GreedyOnly
+	case "left2right":
+		return planbuilder.Gen4Left2Right
+	case "gen4fallback":
+		return planbuilder.Gen4WithFallback
+	}
+
+	log.Warn("unknown planner version configured. using the default")
+	return planbuilder.V3
+}
+
+// GetSemTable implements the ContextVSchema interface
+func (vc *vcursorImpl) GetSemTable() *semantics.SemTable {
+	return vc.semTable
 }
 
 // TargetString returns the current TargetString of the session.
@@ -340,7 +397,7 @@ func (vc *vcursorImpl) Execute(method string, query string, bindVars map[string]
 
 // ExecuteMultiShard is part of the engine.VCursor interface.
 func (vc *vcursorImpl) ExecuteMultiShard(rss []*srvtopo.ResolvedShard, queries []*querypb.BoundQuery, rollbackOnError, autocommit bool) (*sqltypes.Result, []error) {
-	atomic.AddUint32(&vc.logStats.ShardQueries, uint32(len(queries)))
+	atomic.AddUint64(&vc.logStats.ShardQueries, uint64(len(queries)))
 	qr, errs := vc.executor.ExecuteMultiShard(vc.ctx, rss, commentedShardQueries(queries, vc.marginComments), vc.safeSession, autocommit, vc.ignoreMaxMemoryRows)
 
 	if errs == nil && rollbackOnError {
@@ -395,13 +452,13 @@ func (vc *vcursorImpl) ExecuteStandalone(query string, bindVars map[string]*quer
 
 // StreamExeculteMulti is the streaming version of ExecuteMultiShard.
 func (vc *vcursorImpl) StreamExecuteMulti(query string, rss []*srvtopo.ResolvedShard, bindVars []map[string]*querypb.BindVariable, callback func(reply *sqltypes.Result) error) error {
-	atomic.AddUint32(&vc.logStats.ShardQueries, uint32(len(rss)))
+	atomic.AddUint64(&vc.logStats.ShardQueries, uint64(len(rss)))
 	return vc.executor.StreamExecuteMulti(vc.ctx, vc.marginComments.Leading+query+vc.marginComments.Trailing, rss, bindVars, vc.safeSession.Options, callback)
 }
 
 // ExecuteKeyspaceID is part of the engine.VCursor interface.
 func (vc *vcursorImpl) ExecuteKeyspaceID(keyspace string, ksid []byte, query string, bindVars map[string]*querypb.BindVariable, rollbackOnError, autocommit bool) (*sqltypes.Result, error) {
-	atomic.AddUint32(&vc.logStats.ShardQueries, 1)
+	atomic.AddUint64(&vc.logStats.ShardQueries, 1)
 	rss, _, err := vc.ResolveDestinations(keyspace, nil, []key.Destination{key.DestinationKeyspaceID(ksid)})
 	if err != nil {
 		return nil, err
@@ -434,15 +491,19 @@ func (vc *vcursorImpl) SetTarget(target string) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := vc.vschema.Keyspaces[keyspace]; keyspace != "" && !ok {
-		return mysql.NewSQLError(mysql.ERBadDb, mysql.SSSyntaxErrorOrAccessViolation, "Unknown database '%s'", keyspace)
+	if _, ok := vc.vschema.Keyspaces[keyspace]; !ignoreKeyspace(keyspace) && !ok {
+		return vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "unknown database '%s'", keyspace)
 	}
 
 	if vc.safeSession.InTransaction() && tabletType != topodatapb.TabletType_MASTER {
-		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "cannot change to a non-master type in the middle of a transaction: %v", tabletType)
+		return vterrors.NewErrorf(vtrpcpb.Code_INVALID_ARGUMENT, vterrors.LockOrActiveTransaction, "can't execute the given command because you have an active transaction")
 	}
 	vc.safeSession.SetTargetString(target)
 	return nil
+}
+
+func ignoreKeyspace(keyspace string) bool {
+	return keyspace == "" || sqlparser.SystemSchema(keyspace)
 }
 
 func (vc *vcursorImpl) SetUDV(key string, value interface{}) error {
@@ -494,6 +555,9 @@ func (vc *vcursorImpl) TabletType() topodatapb.TabletType {
 
 // SubmitOnlineDDL implements the VCursor interface
 func (vc *vcursorImpl) SubmitOnlineDDL(onlineDDl *schema.OnlineDDL) error {
+	if vc.topoServer == nil {
+		return vterrors.New(vtrpcpb.Code_INTERNAL, "Unable to apply DDL toposerver unavailable, ensure this vtgate is not using filtered keyspaces")
+	}
 	conn, err := vc.topoServer.ConnForCell(vc.ctx, topo.GlobalCell)
 	if err != nil {
 		return err
@@ -523,11 +587,11 @@ func (vc *vcursorImpl) TargetDestination(qualifier string) (key.Destination, *vi
 		keyspaceName = qualifier
 	}
 	if keyspaceName == "" {
-		return nil, nil, 0, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "keyspace not specified")
+		return nil, nil, 0, errNoKeyspace
 	}
 	keyspace := vc.vschema.Keyspaces[keyspaceName]
 	if keyspace == nil {
-		return nil, nil, 0, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "no keyspace with name [%s] found", keyspaceName)
+		return nil, nil, 0, vterrors.NewErrorf(vtrpcpb.Code_NOT_FOUND, vterrors.BadDb, "Unknown database '%s' in vschema", keyspaceName)
 	}
 	return vc.destination, keyspace.Keyspace, vc.tabletType, nil
 }
@@ -571,9 +635,9 @@ func (vc *vcursorImpl) SetWorkload(workload querypb.ExecuteOptions_Workload) {
 	vc.safeSession.GetOrCreateOptions().Workload = workload
 }
 
-// SysVarSetEnabled implements the SessionActions interface
-func (vc *vcursorImpl) SysVarSetEnabled() bool {
-	return *sysVarSetEnabled
+// SetPlannerVersion implements the SessionActions interface
+func (vc *vcursorImpl) SetPlannerVersion(v planbuilder.PlannerVersion) {
+	vc.safeSession.GetOrCreateOptions().PlannerVersion = v
 }
 
 // SetFoundRows implements the SessionActions interface
@@ -583,18 +647,88 @@ func (vc *vcursorImpl) SetFoundRows(foundRows uint64) {
 }
 
 // SetReadAfterWriteGTID implements the SessionActions interface
+func (vc *vcursorImpl) SetDDLStrategy(strategy string) {
+	vc.safeSession.SetDDLStrategy(strategy)
+}
+
+// SetReadAfterWriteGTID implements the SessionActions interface
+func (vc *vcursorImpl) GetDDLStrategy() string {
+	return vc.safeSession.GetDDLStrategy()
+}
+
+// GetSessionUUID implements the SessionActions interface
+func (vc *vcursorImpl) GetSessionUUID() string {
+	return vc.safeSession.GetSessionUUID()
+}
+
+// SetSessionEnableSystemSettings implements the SessionActions interface
+func (vc *vcursorImpl) SetSessionEnableSystemSettings(allow bool) error {
+	vc.safeSession.SetSessionEnableSystemSettings(allow)
+	return nil
+}
+
+// GetSessionEnableSystemSettings implements the SessionActions interface
+func (vc *vcursorImpl) GetSessionEnableSystemSettings() bool {
+	return vc.safeSession.GetSessionEnableSystemSettings()
+}
+
+// SetReadAfterWriteGTID implements the SessionActions interface
 func (vc *vcursorImpl) SetReadAfterWriteGTID(vtgtid string) {
 	vc.safeSession.SetReadAfterWriteGTID(vtgtid)
 }
 
-//SetReadAfterWriteTimeout implements the SessionActions interface
+// SetReadAfterWriteTimeout implements the SessionActions interface
 func (vc *vcursorImpl) SetReadAfterWriteTimeout(timeout float64) {
 	vc.safeSession.SetReadAfterWriteTimeout(timeout)
 }
 
-//SetSessionTrackGTIDs implements the SessionActions interface
+// SetSessionTrackGTIDs implements the SessionActions interface
 func (vc *vcursorImpl) SetSessionTrackGTIDs(enable bool) {
 	vc.safeSession.SetSessionTrackGtids(enable)
+}
+
+// HasCreatedTempTable implements the SessionActions interface
+func (vc *vcursorImpl) HasCreatedTempTable() {
+	vc.safeSession.GetOrCreateOptions().HasCreatedTempTables = true
+}
+
+// GetDBDDLPluginName implements the VCursor interface
+func (vc *vcursorImpl) GetDBDDLPluginName() string {
+	return *dbDDLPlugin
+}
+
+// KeyspaceAvailable implements the VCursor interface
+func (vc *vcursorImpl) KeyspaceAvailable(ks string) bool {
+	_, exists := vc.executor.VSchema().Keyspaces[ks]
+	return exists
+}
+
+// ErrorIfShardedF implements the VCursor interface
+func (vc *vcursorImpl) ErrorIfShardedF(ks *vindexes.Keyspace, warn, errFormat string, params ...interface{}) error {
+	if ks.Sharded {
+		return vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, errFormat, params...)
+	}
+	vc.WarnUnshardedOnly("'%s' not supported in sharded mode", warn)
+
+	return nil
+}
+
+// WarnUnshardedOnly implements the VCursor interface
+func (vc *vcursorImpl) WarnUnshardedOnly(format string, params ...interface{}) {
+	if vc.warnShardedOnly {
+		vc.warnings = append(vc.warnings, &querypb.QueryWarning{
+			Code:    mysql.ERNotSupportedYet,
+			Message: fmt.Sprintf(format, params...),
+		})
+	}
+}
+
+// ForeignKey implements the VCursor interface
+func (vc *vcursorImpl) ForeignKeyMode() string {
+	if foreignKeyMode == nil {
+		return ""
+	}
+	return strings.ToLower(*foreignKeyMode)
 }
 
 // ParseDestinationTarget parses destination target string and sets default keyspace if possible.
@@ -628,4 +762,55 @@ func (vc *vcursorImpl) planPrefixKey() string {
 		return fmt.Sprintf("%s%s%s", vc.keyspace, vindexes.TabletTypeSuffix[vc.tabletType], vc.destination.String())
 	}
 	return fmt.Sprintf("%s%s", vc.keyspace, vindexes.TabletTypeSuffix[vc.tabletType])
+}
+
+func (vc *vcursorImpl) GetKeyspace() string {
+	return vc.keyspace
+}
+
+func (vc *vcursorImpl) ExecuteVSchema(keyspace string, vschemaDDL *sqlparser.AlterVschema) error {
+	srvVschema := vc.vm.GetCurrentSrvVschema()
+	if srvVschema == nil {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vschema not loaded")
+	}
+
+	user := callerid.ImmediateCallerIDFromContext(vc.ctx)
+	allowed := vschemaacl.Authorized(user)
+	if !allowed {
+		return vterrors.NewErrorf(vtrpcpb.Code_PERMISSION_DENIED, vterrors.AccessDeniedError, "User '%s' is not authorized to perform vschema operations", user.GetUsername())
+
+	}
+
+	// Resolve the keyspace either from the table qualifier or the target keyspace
+	var ksName string
+	if !vschemaDDL.Table.IsEmpty() {
+		ksName = vschemaDDL.Table.Qualifier.String()
+	}
+	if ksName == "" {
+		ksName = keyspace
+	}
+	if ksName == "" {
+		return errNoKeyspace
+	}
+
+	ks := srvVschema.Keyspaces[ksName]
+	ks, err := topotools.ApplyVSchemaDDL(ksName, ks, vschemaDDL)
+
+	if err != nil {
+		return err
+	}
+
+	srvVschema.Keyspaces[ksName] = ks
+
+	return vc.vm.UpdateVSchema(vc.ctx, ksName, srvVschema)
+
+}
+
+func (vc *vcursorImpl) MessageStream(rss []*srvtopo.ResolvedShard, tableName string, callback func(*sqltypes.Result) error) error {
+	atomic.AddUint64(&vc.logStats.ShardQueries, uint64(len(rss)))
+	return vc.executor.ExecuteMessageStream(vc.ctx, rss, tableName, callback)
+}
+
+func (vc *vcursorImpl) VStream(rss []*srvtopo.ResolvedShard, filter *binlogdatapb.Filter, gtid string, callback func(evs []*binlogdatapb.VEvent) error) error {
+	return vc.executor.ExecuteVStream(vc.ctx, rss, filter, gtid, callback)
 }

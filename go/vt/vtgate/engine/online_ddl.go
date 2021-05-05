@@ -17,7 +17,10 @@ limitations under the License.
 package engine
 
 import (
+	"fmt"
+
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/proto/query"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
@@ -29,13 +32,14 @@ import (
 
 var _ Primitive = (*OnlineDDL)(nil)
 
-//OnlineDDL represents the instructions to perform an online schema change via vtctld
+// OnlineDDL represents the instructions to perform an online schema change via vtctld
 type OnlineDDL struct {
-	Keyspace *vindexes.Keyspace
-	DDL      *sqlparser.DDL
-	SQL      string
-	Strategy sqlparser.DDLStrategy
-	Options  string
+	Keyspace           *vindexes.Keyspace
+	DDL                sqlparser.DDLStatement
+	SQL                string
+	DDLStrategySetting *schema.DDLStrategySetting
+	// TargetDestination specifies an explicit target destination to send the query to.
+	TargetDestination key.Destination
 
 	noTxNeeded
 
@@ -47,37 +51,28 @@ func (v *OnlineDDL) description() PrimitiveDescription {
 		OperatorType: "OnlineDDL",
 		Keyspace:     v.Keyspace,
 		Other: map[string]interface{}{
-			"query": sqlparser.String(v.DDL),
+			"query": v.SQL,
 		},
 	}
 }
 
-//RouteType implements the Primitive interface
+// RouteType implements the Primitive interface
 func (v *OnlineDDL) RouteType() string {
 	return "OnlineDDL"
 }
 
-//GetKeyspaceName implements the Primitive interface
+// GetKeyspaceName implements the Primitive interface
 func (v *OnlineDDL) GetKeyspaceName() string {
 	return v.Keyspace.Name
 }
 
-//GetTableName implements the Primitive interface
+// GetTableName implements the Primitive interface
 func (v *OnlineDDL) GetTableName() string {
-	return v.DDL.Table.Name.String()
+	return v.DDL.GetTable().Name.String()
 }
 
-//Execute implements the Primitive interface
+// Execute implements the Primitive interface
 func (v *OnlineDDL) Execute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool) (result *sqltypes.Result, err error) {
-	onlineDDL, err := schema.NewOnlineDDL(v.GetKeyspaceName(), v.GetTableName(), v.SQL, v.Strategy, v.Options)
-	if err != nil {
-		return result, err
-	}
-	err = vcursor.SubmitOnlineDDL(onlineDDL)
-	if err != nil {
-		return result, err
-	}
-
 	result = &sqltypes.Result{
 		Fields: []*querypb.Field{
 			{
@@ -85,22 +80,50 @@ func (v *OnlineDDL) Execute(vcursor VCursor, bindVars map[string]*query.BindVari
 				Type: sqltypes.VarChar,
 			},
 		},
-		Rows: [][]sqltypes.Value{
-			{
-				sqltypes.NewVarChar(onlineDDL.UUID),
-			},
-		},
-		RowsAffected: 1,
+		Rows: [][]sqltypes.Value{},
+	}
+	onlineDDLs, err := schema.NewOnlineDDLs(v.GetKeyspaceName(), v.DDL,
+		v.DDLStrategySetting, fmt.Sprintf("vtgate:%s", vcursor.Session().GetSessionUUID()),
+	)
+	if err != nil {
+		return result, err
+	}
+	for _, onlineDDL := range onlineDDLs {
+		if onlineDDL.StrategySetting().IsSkipTopo() {
+			// Go directly to tablets, much like Send primitive does
+			s := Send{
+				Keyspace:          v.Keyspace,
+				TargetDestination: v.TargetDestination,
+				Query:             onlineDDL.SQL,
+				IsDML:             false,
+				SingleShardOnly:   false,
+			}
+			if _, err := s.Execute(vcursor, bindVars, wantfields); err != nil {
+				return result, err
+			}
+		} else {
+			// Submit a request entry in topo. vtctld will take it from there
+			if err := vcursor.SubmitOnlineDDL(onlineDDL); err != nil {
+				return result, err
+			}
+		}
+		result.Rows = append(result.Rows, []sqltypes.Value{
+			sqltypes.NewVarChar(onlineDDL.UUID),
+		})
 	}
 	return result, err
 }
 
 //StreamExecute implements the Primitive interface
-func (v *OnlineDDL) StreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantields bool, callback func(*sqltypes.Result) error) error {
-	return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "not reachable") // TODO: shlomi - have no idea if this should work
+func (v *OnlineDDL) StreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	results, err := v.Execute(vcursor, bindVars, wantfields)
+	if err != nil {
+		return err
+	}
+	return callback(results)
 }
 
 //GetFields implements the Primitive interface
 func (v *OnlineDDL) GetFields(vcursor VCursor, bindVars map[string]*query.BindVariable) (*sqltypes.Result, error) {
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "not reachable") // TODO: shlomi - have no idea if this should work
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "[BUG] GetFields is not reachable")
 }

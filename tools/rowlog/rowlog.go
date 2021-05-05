@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/discovery"
@@ -154,7 +156,7 @@ func startStreaming(ctx context.Context, vtgate, vtctld, keyspace, tablet, table
 		log.Fatal(err)
 	}
 	defer conn.Close()
-	reader, err := conn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter)
+	reader, err := conn.VStream(ctx, topodatapb.TabletType_MASTER, vgtid, filter, &vtgatepb.VStreamFlags{})
 	var fields []*query.Field
 	var gtid string
 	var plan *TablePlan

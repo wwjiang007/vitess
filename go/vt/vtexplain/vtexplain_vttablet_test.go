@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -43,6 +45,13 @@ create table t4 like t3;
 
 create table t5 (like t2);
 
+create table t1_seq(
+  id int,
+  next_id bigint,
+  cache bigint,
+  primary key(id)
+) comment 'vitess_sequence';
+
 create table test_partitioned (
 	id bigint,
 	date_create int,
@@ -58,8 +67,10 @@ create table test_partitioned (
 	if err != nil {
 		t.Fatalf("parseSchema: %v", err)
 	}
-	initTabletEnvironment(ddls, defaultTestOpts())
-
+	{
+		tabletEnv, _ := newTabletEnvironment(ddls, defaultTestOpts())
+		setGlobalTabletEnv(tabletEnv)
+	}
 	tablet := newTablet(defaultTestOpts(), &topodatapb.Tablet{
 		Keyspace: "test_keyspace",
 		Shard:    "-80",
@@ -114,6 +125,11 @@ create table test_partitioned (
 	if t5.HasPrimary() || len(t5.PKColumns) != 0 {
 		t.Errorf("expected !HasPrimary && t5.PKColumns == [] got %v", t5.PKColumns)
 	}
+
+	seq := tables["t1_seq"]
+	if seq.Type != schema.Sequence {
+		t.Errorf("expected t1_seq to be a sequence table but is type %v", seq.Type)
+	}
 }
 
 func TestErrParseSchema(t *testing.T) {
@@ -125,7 +141,8 @@ create table t1 like t2;
 	if err != nil {
 		t.Fatalf("parseSchema: %v", err)
 	}
-	err = initTabletEnvironment(ddl, defaultTestOpts())
+
+	_, err = newTabletEnvironment(ddl, defaultTestOpts())
 	if err.Error() != expected {
 		t.Errorf("want: %s, got %s", expected, err.Error())
 	}

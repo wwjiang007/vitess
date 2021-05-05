@@ -17,7 +17,10 @@ import (
 	"flag"
 	"time"
 
-	"golang.org/x/net/context"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+
+	"context"
+
 	"vitess.io/vitess/go/vt/log"
 
 	"vitess.io/vitess/go/vt/discovery"
@@ -67,7 +70,7 @@ type Gateway interface {
 	TabletsCacheStatus() discovery.TabletsCacheStatusList
 
 	// TabletByAlias returns a QueryService
-	QueryServiceByAlias(alias *topodatapb.TabletAlias) (queryservice.QueryService, error)
+	QueryServiceByAlias(alias *topodatapb.TabletAlias, target *querypb.Target) (queryservice.QueryService, error)
 }
 
 // Creator is the factory method which can create the actual gateway object.

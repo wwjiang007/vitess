@@ -73,7 +73,6 @@ func MakeTestResult(fields []*querypb.Field, rows ...string) *Result {
 			result.Rows[i][j] = MakeTrusted(fields[j].Type, []byte(col))
 		}
 	}
-	result.RowsAffected = uint64(len(result.Rows))
 	return result
 }
 
@@ -146,9 +145,5 @@ func PrintResults(results []*Result) string {
 }
 
 func split(str string) []string {
-	splits := strings.Split(str, "|")
-	for i, v := range splits {
-		splits[i] = strings.TrimSpace(v)
-	}
-	return splits
+	return strings.Split(str, "|")
 }

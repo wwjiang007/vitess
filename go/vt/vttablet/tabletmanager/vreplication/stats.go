@@ -19,7 +19,11 @@ package vreplication
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"time"
+
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/servenv"
@@ -58,6 +62,15 @@ type vrStats struct {
 func (st *vrStats) register() {
 	stats.NewGaugeFunc("VReplicationStreamCount", "Number of vreplication streams", st.numControllers)
 	stats.NewGaugeFunc("VReplicationSecondsBehindMasterMax", "Max vreplication seconds behind master", st.maxSecondsBehindMaster)
+	stats.Publish("VReplicationStreamState", stats.StringMapFunc(func() map[string]string {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		result := make(map[string]string, len(st.controllers))
+		for _, ct := range st.controllers {
+			result[ct.workflow+"."+fmt.Sprintf("%v", ct.id)] = ct.blpStats.State.Get()
+		}
+		return result
+	}))
 	stats.NewGaugesFuncWithMultiLabels(
 		"VReplicationSecondsBehindMaster",
 		"vreplication seconds behind master per stream",
@@ -118,7 +131,20 @@ func (st *vrStats) register() {
 		}
 		return result
 	}))
-
+	stats.Publish("VReplicationMessages", stats.StringMapFunc(func() map[string]string {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		result := make(map[string]string, len(st.controllers))
+		for _, ct := range st.controllers {
+			var messages []string
+			for _, rec := range ct.blpStats.History.Records() {
+				hist := rec.(*binlogplayer.StatsHistoryRecord)
+				messages = append(messages, fmt.Sprintf("%s:%s", hist.Time.Format(time.RFC3339Nano), hist.Message))
+			}
+			result[fmt.Sprintf("%v", ct.id)] = strings.Join(messages, "; ")
+		}
+		return result
+	}))
 	stats.NewGaugesFuncWithMultiLabels(
 		"VReplicationPhaseTimings",
 		"vreplication per phase timings per stream",
@@ -200,6 +226,39 @@ func (st *vrStats) register() {
 		})
 
 	stats.NewGaugesFuncWithMultiLabels(
+		"VReplicationNoopQueryCount",
+		"vreplication noop query counts per stream",
+		[]string{"source_keyspace", "source_shard", "workflow", "counts", "phase"},
+		func() map[string]int64 {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			result := make(map[string]int64, len(st.controllers))
+			for _, ct := range st.controllers {
+				for label, count := range ct.blpStats.NoopQueryCount.Counts() {
+					if label == "" {
+						continue
+					}
+					result[ct.source.Keyspace+"."+ct.source.Shard+"."+ct.workflow+"."+fmt.Sprintf("%v", ct.id)+"."+label] = count
+				}
+			}
+			return result
+		})
+
+	stats.NewCounterFunc(
+		"VReplicationNoopQueryCountTotal",
+		"vreplication query noop counts aggregated across all streams",
+		func() int64 {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			result := int64(0)
+			for _, ct := range st.controllers {
+				for _, count := range ct.blpStats.NoopQueryCount.Counts() {
+					result += count
+				}
+			}
+			return result
+		})
+	stats.NewGaugesFuncWithMultiLabels(
 		"VReplicationCopyRowCount",
 		"vreplication rows copied in copy phase per stream",
 		[]string{"source_keyspace", "source_shard", "workflow", "counts"},
@@ -262,11 +321,25 @@ func (st *vrStats) register() {
 			result := make(map[string]int64)
 			for _, ct := range st.controllers {
 				for key, val := range ct.blpStats.ErrorCounts.Counts() {
-					result[fmt.Sprintf("%d_%s", ct.id, key)] = val
+					result[fmt.Sprintf("%s.%d.%s", ct.workflow, ct.id, key)] = val
 				}
 			}
 			return result
 		})
+	stats.NewGaugesFuncWithMultiLabels(
+		"VReplicationHeartbeat",
+		"Time when last heartbeat was received from a vstreamer",
+		[]string{"source_keyspace", "source_shard", "workflow", "time"},
+		func() map[string]int64 {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			result := make(map[string]int64, len(st.controllers))
+			for _, ct := range st.controllers {
+				result[ct.source.Keyspace+"."+ct.source.Shard+"."+ct.workflow+"."+fmt.Sprintf("%v", ct.id)] = ct.blpStats.Heartbeat()
+			}
+			return result
+		})
+
 }
 
 func (st *vrStats) numControllers() int64 {
@@ -302,6 +375,7 @@ func (st *vrStats) status() *EngineStatus {
 			Source:              ct.source.String(),
 			StopPosition:        ct.stopPos,
 			LastPosition:        ct.blpStats.LastPosition().String(),
+			Heartbeat:           ct.blpStats.Heartbeat(),
 			SecondsBehindMaster: ct.blpStats.SecondsBehindMaster.Get(),
 			Counts:              ct.blpStats.Timings.Counts(),
 			Rates:               ct.blpStats.Rates.Get(),
@@ -312,6 +386,7 @@ func (st *vrStats) status() *EngineStatus {
 			PhaseTimings:        ct.blpStats.PhaseTimings.Counts(),
 			CopyRowCount:        ct.blpStats.CopyRowCount.Get(),
 			CopyLoopCount:       ct.blpStats.CopyLoopCount.Get(),
+			NoopQueryCounts:     ct.blpStats.NoopQueryCount.Counts(),
 		}
 		i++
 	}
@@ -332,6 +407,7 @@ type ControllerStatus struct {
 	SourceShard         string
 	StopPosition        string
 	LastPosition        string
+	Heartbeat           int64
 	SecondsBehindMaster int64
 	Counts              map[string]int64
 	Rates               map[string][]float64
@@ -342,6 +418,7 @@ type ControllerStatus struct {
 	PhaseTimings        map[string]int64
 	CopyRowCount        int64
 	CopyLoopCount       int64
+	NoopQueryCounts     map[string]int64
 }
 
 var vreplicationTemplate = `

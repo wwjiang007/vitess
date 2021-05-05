@@ -21,10 +21,15 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"vitess.io/vitess/go/vt/servenv"
+
+	"context"
+
 	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/trace"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/log"
@@ -57,6 +62,8 @@ type tmState struct {
 	mu                sync.Mutex
 	isOpen            bool
 	isResharding      bool
+	isInSrvKeyspace   bool
+	isShardServing    map[topodatapb.TabletType]bool
 	tabletControls    map[topodatapb.TabletType]bool
 	blacklistedTables map[topodatapb.TabletType][]string
 	tablet            *topodatapb.Tablet
@@ -134,8 +141,17 @@ func (ts *tmState) RefreshFromTopoInfo(ctx context.Context, shardInfo *topo.Shar
 	}
 
 	if srvKeyspace != nil {
+		ts.isShardServing = make(map[topodatapb.TabletType]bool)
 		ts.tabletControls = make(map[topodatapb.TabletType]bool)
+
 		for _, partition := range srvKeyspace.GetPartitions() {
+
+			for _, shard := range partition.GetShardReferences() {
+				if key.KeyRangeEqual(shard.GetKeyRange(), ts.tablet.KeyRange) {
+					ts.isShardServing[partition.GetServedType()] = true
+				}
+			}
+
 			for _, tabletControl := range partition.GetShardTabletControls() {
 				if key.KeyRangeEqual(tabletControl.GetKeyRange(), ts.KeyRange()) {
 					if tabletControl.QueryServiceDisabled {
@@ -247,6 +263,14 @@ func (ts *tmState) updateLocked(ctx context.Context) {
 		}
 	}
 
+	if ts.isShardServing[ts.tablet.Type] {
+		ts.isInSrvKeyspace = true
+		statsIsInSrvKeyspace.Set(1)
+	} else {
+		ts.isInSrvKeyspace = false
+		statsIsInSrvKeyspace.Set(0)
+	}
+
 	// Open TabletServer last so that it advertises serving after all other services are up.
 	if reason == "" {
 		if err := ts.tm.QueryServiceControl.SetServingType(ts.tablet.Type, terTime, true, ""); err != nil {
@@ -314,6 +338,11 @@ func (ts *tmState) publishStateLocked(ctx context.Context) {
 		return nil
 	})
 	if err != nil {
+		if topo.IsErrType(err, topo.NoNode) { // Someone deleted the tablet record under us. Shut down gracefully.
+			log.Error("Tablet record has disappeared, shutting down")
+			servenv.ExitChan <- syscall.SIGTERM
+			return
+		}
 		log.Errorf("Unable to publish state to topo, will keep retrying: %v", err)
 		ts.isPublishing = true
 		// Keep retrying until success.
@@ -341,6 +370,11 @@ func (ts *tmState) retryPublish() {
 		})
 		cancel()
 		if err != nil {
+			if topo.IsErrType(err, topo.NoNode) { // Someone deleted the tablet record under us. Shut down gracefully.
+				log.Error("Tablet record has disappeared, shutting down")
+				servenv.ExitChan <- syscall.SIGTERM
+				return
+			}
 			log.Errorf("Unable to publish state to topo, will keep retrying: %v", err)
 			ts.mu.Unlock()
 			time.Sleep(*publishRetryInterval)

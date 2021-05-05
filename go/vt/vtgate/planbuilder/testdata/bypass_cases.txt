@@ -10,11 +10,10 @@
       "Sharded": false
     },
     "TargetDestination": "Shard(-80)",
-    "IsDML": false,
-    "Query": "select count(*), col from unsharded",
-    "SingleShardOnly": false
+    "Query": "select count(*), col from unsharded"
   }
 }
+Gen4 plan same as above
 
 # update bypass
 "update user set val = 1 where id = 18446744073709551616 and id = 1"
@@ -29,10 +28,10 @@
     },
     "TargetDestination": "Shard(-80)",
     "IsDML": true,
-    "Query": "update user set val = 1 where id = 18446744073709551616 and id = 1",
-    "SingleShardOnly": false
+    "Query": "update `user` set val = 1 where id = 18446744073709551616 and id = 1"
   }
 }
+Gen4 plan same as above
 
 # delete bypass
 "DELETE FROM USER WHERE ID = 42"
@@ -47,10 +46,10 @@
     },
     "TargetDestination": "Shard(-80)",
     "IsDML": true,
-    "Query": "delete from USER where ID = 42",
-    "SingleShardOnly": false
+    "Query": "delete from `USER` where ID = 42"
   }
 }
+Gen4 plan same as above
 
 # insert bypass
 "INSERT INTO USER (ID, NAME) VALUES (42, 'ms X')"
@@ -65,10 +64,10 @@
     },
     "TargetDestination": "Shard(-80)",
     "IsDML": true,
-    "Query": "insert into USER(ID, NAME) values (42, 'ms X')",
-    "SingleShardOnly": false
+    "Query": "insert into `USER`(ID, `NAME`) values (42, 'ms X')"
   }
 }
+Gen4 plan same as above
 
 # insert bypass with sequence: sequences ignored
 "insert into user(nonid) values (2)"
@@ -83,10 +82,10 @@
     },
     "TargetDestination": "Shard(-80)",
     "IsDML": true,
-    "Query": "insert into user(nonid) values (2)",
-    "SingleShardOnly": false
+    "Query": "insert into `user`(nonid) values (2)"
   }
 }
+Gen4 plan same as above
 
 # bypass query for into outfile s3
 "select count(*), col from unsharded into outfile S3 'x.txt'"
@@ -100,12 +99,12 @@
       "Sharded": false
     },
     "TargetDestination": "Shard(-80)",
-    "IsDML": false,
-    "Query": "select count(*), col from unsharded into outfile s3 'x.txt'",
-    "SingleShardOnly": false
+    "Query": "select count(*), col from unsharded into outfile s3 'x.txt'"
   }
 }
+Gen4 plan same as above
 
+# Select outfile
 "select * from user into outfile S3 'x.txt'"
 {
   "QueryType": "SELECT",
@@ -117,11 +116,10 @@
       "Sharded": false
     },
     "TargetDestination": "Shard(-80)",
-    "IsDML": false,
-    "Query": "select * from user into outfile s3 'x.txt'",
-    "SingleShardOnly": false
+    "Query": "select * from `user` into outfile s3 'x.txt'"
   }
 }
+Gen4 plan same as above
 
 "load data from s3 'x.txt' into table x"
 {
@@ -139,6 +137,7 @@
     "SingleShardOnly": true
   }
 }
+Gen4 plan same as above
 
 "load data from s3 'x.txt'"
 {
@@ -156,3 +155,21 @@
     "SingleShardOnly": true
   }
 }
+Gen4 plan same as above
+
+# create table
+"create /* test */ table t1(id bigint, primary key(id)) /* comments */"
+{
+  "QueryType": "DDL",
+  "Original": "create /* test */ table t1(id bigint, primary key(id)) /* comments */",
+  "Instructions": {
+    "OperatorType": "Send",
+    "Keyspace": {
+      "Name": "main",
+      "Sharded": false
+    },
+    "TargetDestination": "Shard(-80)",
+    "Query": "create /* test */ table t1(id bigint, primary key(id)) /* comments */"
+  }
+}
+Gen4 plan same as above

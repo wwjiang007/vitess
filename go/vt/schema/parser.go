@@ -20,18 +20,21 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 )
+
+// NormalizedDDLQuery contains a query which is online-ddl -normalized
+type NormalizedDDLQuery struct {
+	SQL       string
+	TableName sqlparser.TableName
+}
 
 var (
 	// ALTER TABLE
-	// ALTER WITH_GHOST TABLE
-	// ALTER WITH_GHOST LAG_'--max-lag-millis=2.5 --throttle-http=...' TABLE
-	// ALTER WITH_PT TABLE
-	alterTableBasicPattern               = `(?s)(?i)\balter\s+(with\s+|\s+|).*?table\s+`
+	alterTableBasicPattern               = `(?s)(?i)\balter\s+table\s+`
 	alterTableExplicitSchemaTableRegexps = []*regexp.Regexp{
 		// ALTER TABLE `scm`.`tbl` something
-		// ALTER WITH_GHOST TABLE `scm`.`tbl` something
-		// ALTER WITH_PT TABLE `scm`.`tbl` something
 		regexp.MustCompile(alterTableBasicPattern + "`" + `([^` + "`" + `]+)` + "`" + `[.]` + "`" + `([^` + "`" + `]+)` + "`" + `\s+(.*$)`),
 		// ALTER TABLE `scm`.tbl something
 		regexp.MustCompile(alterTableBasicPattern + "`" + `([^` + "`" + `]+)` + "`" + `[.]([\S]+)\s+(.*$)`),
@@ -46,7 +49,22 @@ var (
 		// ALTER TABLE tbl something
 		regexp.MustCompile(alterTableBasicPattern + `([\S]+)\s+(.*$)`),
 	}
+	createTableRegexp     = regexp.MustCompile(`(?s)(?i)(CREATE\s+TABLE\s+)` + "`" + `([^` + "`" + `]+)` + "`" + `(\s*[(].*$)`)
+	revertStatementRegexp = regexp.MustCompile(`(?i)^revert\s+([\S]*)$`)
 )
+
+// ReplaceTableNameInCreateTableStatement returns a modified CREATE TABLE statement, such that the table name is replaced with given name.
+// This intentionally string-replacement based, and not sqlparser.String() based, because the return statement has to be formatted _precisely_,
+// up to MySQL version nuances, like the original statement. That's in favor of tengo table comparison.
+// We expect a well formatted, no-qualifier statement in the form:
+// CREATE TABLE `some_table` ...
+func ReplaceTableNameInCreateTableStatement(createStatement string, replacementName string) (modifiedStatement string, err error) {
+	submatch := createTableRegexp.FindStringSubmatch(createStatement)
+	if len(submatch) == 0 {
+		return createStatement, fmt.Errorf("could not parse statement: %s", createStatement)
+	}
+	return fmt.Sprintf("%s`%s`%s", submatch[1], replacementName, submatch[3]), nil
+}
 
 // ParseAlterTableOptions parses a ALTER ... TABLE... statement into:
 // - explicit schema and table, if available
@@ -55,33 +73,31 @@ func ParseAlterTableOptions(alterStatement string) (explicitSchema, explicitTabl
 	alterOptions = strings.TrimSpace(alterStatement)
 	for _, alterTableRegexp := range alterTableExplicitSchemaTableRegexps {
 		if submatch := alterTableRegexp.FindStringSubmatch(alterOptions); len(submatch) > 0 {
-			explicitSchema = submatch[2]
-			explicitTable = submatch[3]
-			alterOptions = submatch[4]
+			explicitSchema = submatch[1]
+			explicitTable = submatch[2]
+			alterOptions = submatch[3]
 			return explicitSchema, explicitTable, alterOptions
 		}
 	}
 	for _, alterTableRegexp := range alterTableExplicitTableRegexps {
 		if submatch := alterTableRegexp.FindStringSubmatch(alterOptions); len(submatch) > 0 {
-			explicitTable = submatch[2]
-			alterOptions = submatch[3]
+			explicitTable = submatch[1]
+			alterOptions = submatch[2]
 			return explicitSchema, explicitTable, alterOptions
 		}
 	}
 	return explicitSchema, explicitTable, alterOptions
 }
 
-// RemoveOnlineDDLHints removes a WITH_GHOST or WITH_PT hint, which is vitess-specific,
-// from an ALTER TABLE statement
-// e.g "ALTER WITH 'gh-ost' TABLE my_table DROP COLUMN i" -> "ALTER TABLE `my_table` DROP COLUMN i"
-func RemoveOnlineDDLHints(alterStatement string) (normalizedAlterStatement string) {
-	explicitSchema, explicitTable, alterOptions := ParseAlterTableOptions(alterStatement)
-
-	if explicitTable == "" {
-		return alterOptions
+// legacyParseRevertUUID expects a query like "revert 4e5dcf80_354b_11eb_82cd_f875a4d24e90" and returns the UUID value.
+func legacyParseRevertUUID(sql string) (uuid string, err error) {
+	submatch := revertStatementRegexp.FindStringSubmatch(sql)
+	if len(submatch) == 0 {
+		return "", fmt.Errorf("Not a Revert DDL: '%s'", sql)
 	}
-	if explicitSchema == "" {
-		return fmt.Sprintf("ALTER TABLE `%s` %s", explicitTable, alterOptions)
+	uuid = submatch[1]
+	if !IsOnlineDDLUUID(uuid) {
+		return "", fmt.Errorf("Not an online DDL UUID: '%s'", uuid)
 	}
-	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", explicitSchema, explicitTable, alterOptions)
+	return uuid, nil
 }
